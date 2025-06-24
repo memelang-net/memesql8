@@ -1,53 +1,63 @@
 '''
-Memelang v8.03 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
+Memelang v8.04 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
 This script is optimized for training LLMs
 
-ANALOGY TO RELATIONAL DATABASE
-AXIS: 0->Value 1->Column_Name 2->Row_Primary_Key 3->Table_Name
+1. EXAMPLE QUERY
+MEMELANG: "Mark Hamill",Mark actor * movies; "Star Wars" movie; >4 rating;;
+
+SQL LIMIT_AXIS ANALOG:  0->Value  1->Column_Name  2->Row_Primary_Key  3->Table_Name
 SQL: SELECT ... FROM movies WHERE row_id=* AND actor IN ("Mark Hamill", "Mark") AND movie="Star Wars" AND rating>4
-MEMELANG: "Mark Hamill",Mark actor * movies | "Star Wars" movie | >4 rating;
+
+RDF LIMIT_AXIS ANALOG:  0->Object_Value  1->Predicate_Name  2->Subject_URI  3->Graph_Name
+SPARQL: SELECT … WHERE { GRAPH <movies> {?s actor ?o . FILTER(?o IN ("Mark Hamill","Mark")) . ?s movie "Star Wars" . ?s rating ?r . FILTER(?r > 4)} }
+
+2. EXAMPLE JOIN QUERY
+MEMELANG: "Mark Hamill" actor * movies; * movie; _ _ !; * actor;;
+SQL: SELECT co.actor FROM movies AS mh JOIN movies AS co ON co.movie=mh.movie AND co.row_id!=mh.row_id WHERE mh.actor='Mark Hamill';
+RDF: SELECT ?coActor WHERE { GRAPH <movies> { ?mhRow ex:actor "Mark Hamill" ; ex:movie ?movie . ?coRow ex:movie ?movie ; ex:actor ?coActor . FILTER ( ?coRow != ?mhRow ) } }
 '''
 
 import random, re, json, copy
-from typing import List, Dict, Any, Iterator
+from typing import List, Dict, Any, Iterator, Union
 from dataclasses import dataclass, field
+
+Axis = int # >=0
+Datum = Union[str, float, int]
 
 SEP_LIST, SEP_LIMIT, WILD, SIGIL = ',', ' ', '*', '#'
 
-INLINE_QUERY_MODE = False
-if INLINE_QUERY_MODE: SEP_VECT, SEP_QUERY = ' | ', '; '
-else: SEP_VECT, SEP_QUERY = '\n', ';\n\n'
-
+PRETTY_TRAIL = '\n' # ' '
+SEP_VECT, SEP_QUERY = ';'+PRETTY_TRAIL, ';;'+PRETTY_TRAIL+PRETTY_TRAIL
 
 TOKEN_KIND_PATTERNS = (
 	('COMMENT',		r'//[^\n]*'),
-	('STAR',		r'"\*"'), # LITERAL ASTERISK, NOT WILDCARD, FOR TRAINING DISTINCTION
 	('QUOTE',		r'"(?:[^"\\]|\\.)*"'), # ALWAYS JSON QUOTE ESCAPE EXOTIC CHARS name="John \"Jack\" Kennedy"
-	('SEP_QUERY',	r';'),
-	('SEP_VECT',	r'\n|\|'),
+	('SEP_QUERY',	r';;'), # DISJUNCTION
+	('SEP_VECT',	r';'), # JUNCTION
 	('SEP_LIMIT',	r'[ ]'),
 	('SEP_LIST',	r','), # OR LIST
 	('INEQL',		r'!=|>=|<=|>|<'),
 	('EQL',			r'='),
-	('WILD',		r'\*'), # WILDCARD
+	('WILD',		r'\*'), # WILDCARD, NEVER QUOTE
 	('IDENT',		r'[A-Za-z][A-Za-z0-9_]*'), # ALPHANUMERIC IDENTIFIERS ARE UNQUOTED
 	('FLOAT',		r'-?\d*\.\d+'),
 	('INT',			r'-?\d+'),
-	('VAR',			rf'{SIGIL}\d+(?:{SIGIL}\d+)?'),
+	('VAR',			rf'{SIGIL}\d+(?:{SIGIL}\d+){{0,2}}'),
 	('SAME',		r'_'), # VARIABLE: "SAME VALUE"
+	('DIFF',		r'!'), # VARIABLE: "DIFFERENT VALUE"
 	('MISMATCH',	r'.'),
 )
 
 MASTER_PATTERN = re.compile('|'.join(f'(?P<{kind}>{pat})' for kind, pat in TOKEN_KIND_PATTERNS))
 
-DAT_KINDS = {'IDENT', 'QUOTE', 'STAR', 'INT', 'FLOAT', 'VAR', 'SAME', 'WILD'}
-UNITARY_KINDS = {'IDENT', 'QUOTE', 'STAR', 'INT', 'FLOAT', 'EQL'}
+DAT_KINDS = {'IDENT', 'QUOTE', 'INT', 'FLOAT', 'VAR', 'SAME', 'DIFF', 'WILD'}
+UNITARY_KINDS = {'IDENT', 'QUOTE', 'INT', 'FLOAT', 'EQL'}
 
 class Token:
 	kind: str
 	lexeme: str|None
 	children: List['Token']
-	datum: Any
+	datum: Datum
 	unitary: bool
 
 	def __init__(self, kind: str, lexeme: str = '', children: List['Token']|None = None):
@@ -73,11 +83,11 @@ class Token:
 
 	def __str__(self) -> str:
 		if self.children: return self.lexeme.join(map(str, self.children))
-		else: return '' if self.kind=='EQL' else self.lexeme  # ELIDED
+		else: return '' if self.kind=='EQL' else self.lexeme # ELIDED
 
 TOK_EQUALS = Token('EQL', '=')
 TOK_SAME = Token('LIST', SEP_LIST, [Token('SAME', '_')])
-TOK_EQUALS_SAME = Token('LIMIT', '', [TOK_EQUALS, TOK_SAME])
+TOK_LIMIT_SAME = Token('LIMIT', '', [TOK_EQUALS, TOK_SAME])
 
 
 class Memelang(Token):
@@ -87,12 +97,13 @@ class Memelang(Token):
 		self.src = src
 		self.kind = 'QUERY'
 		self.i=0
+		self.results: List[List[List[List[Datum]]]] = []
 
 		# Sanitize
 		self.datum = re.sub(r'[ ]+', ' ', self.src)
-		self.datum = re.sub(r'\s*\|\s*', '|', self.datum)
+		self.datum = re.sub(r'\s*;;\s*', ';;', self.datum)
+		self.datum = re.sub(r'\s*;\s*', ';', self.datum)
 		self.datum = re.sub(r'[ ]*[\r\n]\s*', '\n', self.datum)
-		self.datum = re.sub(r'\s*;[;\s]*', ';', self.datum)
 
 		# TOKENS FROM TOKEN_KIND_PATTERNS
 		for m in MASTER_PATTERN.finditer(self.datum):
@@ -107,19 +118,16 @@ class Memelang(Token):
 		self.replace(list(self.pass_limit()))
 		self.replace(list(self.pass_vect()))
 		self.replace(list(self.pass_matrix()))
+		self.carry_fwd()
+		self.build_results()
 
-	def peek(self) -> Token|None:
-		return self.children[self.i] if self.i < self.length else None
-
-	def peek_kind(self) -> str|None:
-		token = self.peek()
-		return token.kind if token else None
+	def peek(self) -> str|None:
+		return self.children[self.i].kind if self.i < self.length else None
 
 	def next(self) -> Token:
-		tok = self.peek()
-		if tok is None: raise SyntaxError('E_EOF')
+		if self.i >= self.length: raise SyntaxError('E_EOF')
 		self.i += 1
-		return tok
+		return self.children[self.i-1]
 
 	def replace(self, children: List[Token]):
 		self.i = 0
@@ -131,22 +139,22 @@ class Memelang(Token):
 	# OR semantic list of datums
 	def pass_list(self):
 		while self.peek():
-			if self.peek_kind() in DAT_KINDS:
+			if self.peek() in DAT_KINDS:
 				# NEVER WRAP LIST IN QUOTES
 				child_tokens: List[Token] = [self.next()]
 
-				while self.peek_kind() == 'SEP_LIST':
+				while self.peek() == 'SEP_LIST':
 					# NEVER SPACES AROUND COMMA
 					self.next()
-					if self.peek_kind() not in DAT_KINDS: raise SyntaxError('E_LIST_KIND')
+					if self.peek() not in DAT_KINDS: raise SyntaxError('E_LIST_KIND')
 
 					# NEVER WILDS IN LIST
-					if 'WILD' in (child_tokens[0].kind, self.peek_kind()): raise SyntaxError('E_LIST_WILD')
+					if 'WILD' in (child_tokens[0].kind, self.peek()): raise SyntaxError('E_LIST_WILD')
 					child_tokens.append(self.next())
 
 				yield Token('LIST', SEP_LIST, child_tokens)
 
-			elif self.peek_kind() == 'SEP_LIST': raise SyntaxError('E_LIST_SEP')
+			elif self.peek() == 'SEP_LIST': raise SyntaxError('E_LIST_SEP')
 
 			else: yield self.next()
 
@@ -155,13 +163,13 @@ class Memelang(Token):
 	def pass_limit(self):
 
 		while self.peek():
-			if self.peek_kind() in {'EQL','INEQL','LIST'}:
-				opr = TOK_EQUALS if self.peek_kind() not in {'EQL', 'INEQL'} else self.next()
+			if self.peek() in {'EQL','INEQL','LIST'}:
+				opr = TOK_EQUALS if self.peek() not in {'EQL', 'INEQL'} else self.next()
 
 				# NEVER SPACE AFTER OPERATOR
-				if self.peek_kind() == 'SEP_LIMIT': raise SyntaxError('E_OPR_SPACE')
+				if self.peek() == 'SEP_LIMIT': raise SyntaxError('E_OPR_SPACE')
 
-				if self.peek_kind() != 'LIST': raise SyntaxError('E_OPR_LIST')
+				if self.peek() != 'LIST': raise SyntaxError('E_OPR_LIST')
 				dlist = self.next()
 				child_length = len(dlist.children)
 
@@ -170,65 +178,81 @@ class Memelang(Token):
 
 				yield Token('LIMIT', '', [opr,dlist])
 
-			elif self.peek_kind() in {'SEP_LIMIT','SEP_VECT','SEP_QUERY'}: yield self.next()
+			elif self.peek() in {'SEP_LIMIT','SEP_VECT','SEP_QUERY'}: yield self.next()
 			else: raise SyntaxError('E_TOK')
 
 	# VECT ::= LIMIT {SEP_LIMIT LIMIT}
 	# Vector of axis constraints
 	def pass_vect(self):
 		child_tokens: List[Token] = []
-		limit_idx = 0
 		while self.peek():
-			if self.peek_kind() == 'LIMIT':
+			if self.peek() == 'LIMIT':
 				token = self.next()
 				child_tokens.append(token)
-				limit_idx += 1
-				if self.peek_kind() == 'LIMIT': raise SyntaxError('E_SEP_LIMIT')
+				if self.peek() == 'LIMIT': raise SyntaxError('E_SEP_LIMIT')
 
-			elif self.peek_kind() in {None, 'SEP_VECT', 'SEP_QUERY'}:
+			elif self.peek() in {None, 'SEP_VECT', 'SEP_QUERY'}:
 				if child_tokens: yield Token('VECT', SEP_LIMIT, child_tokens)
 				child_tokens = []
-				limit_idx = 0
-				if self.peek_kind(): yield self.next()
+				if self.peek(): yield self.next()
 
-			elif self.peek_kind() == 'SEP_LIMIT': self.next()
+			elif self.peek() == 'SEP_LIMIT': self.next()
 			else: raise SyntaxError('E_TOK')
 
 	# MTRX ::= VECT {SEP_VECT VECT}
 	# Matrix of axis constraints
 	def pass_matrix(self):
 		child_tokens: List[Token] = []
-		vect_idx = 0
 		while self.peek():
-			if self.peek_kind() == 'VECT':
+			if self.peek() == 'VECT':
 				token = self.next()
 				child_tokens.append(token)
-				vect_idx += 1
-			elif self.peek_kind() in {None, 'SEP_QUERY'}:
+			elif self.peek() in {None, 'SEP_QUERY'}:
 				if child_tokens: yield Token('MTRX', SEP_VECT, child_tokens)
 				child_tokens = []
-				vect_idx = 0
-				if self.peek_kind(): self.next()
-			elif self.peek_kind() == 'SEP_VECT': self.next()
+				if self.peek(): self.next()
+			elif self.peek() == 'SEP_VECT': self.next()
 			else: raise SyntaxError('E_TOK')
 
 
-	# RESOLVE VARIABLES AS #VECT#LIMIT COORDINATES OF THE (QUERY FOR NOW)
-	def resolve_token(self, mtrx_idx:int, vartok: Token):
+	# HIGHER AXIS RESULTS CARRY FORWARD UNTIL END OF MATRIX
+	def carry_fwd(self) -> None:
+		for mtrx_axis, mtrx in enumerate(self.children):
+			if mtrx.kind != 'MTRX': raise TypeError('E_TYPE_MTRX')
+			max_vect_len = 1
+			for vect_axis, vect in enumerate(mtrx.children):
+				if vect.kind != 'VECT': raise TypeError('E_TYPE_VECT')
+				if not all(limit.kind == 'LIMIT' for limit in vect.children): raise TypeError('E_TYPE_LIMIT')
+				vect_len = len(vect.children)
+				gap = max_vect_len - vect_len
+				if gap>0: vect.children.extend(TOK_LIMIT_SAME for _ in range(gap))
+				elif gap<0: max_vect_len = vect_len
+
+
+	def build_results(self) -> None:
+		# self.results[mtrx_axis][vect_axis][limit_axis] = []
+		self.results = [[[[] for limit in vect.children] for vect in mtrx.children] for mtrx in self.children]
+
+
+	# VAR ::= # LIMIT [# VECT [# MTRX]]]
+	# VARIABLES ARE AXIS COORDINATES OF PRIOR RESULTS
+	def resolve_token(self, vartok: Token, from_limit_axis:Axis, from_vect_axis:Axis, from_mtrx_axis:Axis) -> List[Datum]:
 		if vartok.kind!='VAR': raise TypeError('VAR')
 
-		if len(self.children)<=mtrx_idx: raise SyntaxError('E_VAR')
-		mtrx = self.children[mtrx_idx]
-		if mtrx.kind != 'MTRX': raise TypeError('MTRX')
-		
-		parts = vartok.lexeme[1:].split(SIGIL)
-		vect_idx = int(parts[0])
-		limit_idx = 0 if len(parts) == 1 else int(parts[1])
+		try: parts = [int(p) for p in vartok.lexeme.lstrip(SIGIL).split(SIGIL)]
+		except ValueError: raise SyntaxError('E_VAR_PARSE')
 
-		if len(mtrx.children)<=vect_idx: raise SyntaxError('E_VAR')
-		vect = mtrx.children[vect_idx]
-		if vect.kind != 'VECT': raise TypeError('VECT')
-		if len(vect.children)<=limit_idx: raise SyntaxError('E_VAR')
-		if vect.children[limit_idx].kind != 'LIMIT': raise TypeError('LIMIT')
+		if any(idx < 0 for idx in parts): raise SyntaxError('E_VAR_NEG')
+		if len(parts) > 3: raise SyntaxError('E_VAR_LONG') # NOT 4D YET
 
-		return vect.children[limit_idx]
+		limit_axis = parts[0]
+		vect_axis = from_vect_axis if len(parts)<2 else parts[1]
+		mtrx_axis = from_mtrx_axis if len(parts)<3 else parts[2]
+
+		# ALWAYS VARIABLES REFERENCE *PRIOR* LIMITS
+		if (mtrx_axis, vect_axis, limit_axis) >= (from_mtrx_axis, from_vect_axis, from_limit_axis): raise SyntaxError('E_VAR_FWD')
+
+		try: result_limit = self.results[mtrx_axis][vect_axis][limit_axis]
+		except IndexError: raise SyntaxError('E_VAR_OOB')
+
+		return result_limit
