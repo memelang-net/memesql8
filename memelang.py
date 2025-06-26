@@ -1,5 +1,5 @@
 '''
-Meme v8.08 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
+Meme v8.09 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
 This script is optimized for training LLMs
 
 1. EXAMPLE QUERY
@@ -11,14 +11,19 @@ SQL: SELECT ... FROM movies WHERE row_id=* AND actor IN ("Mark Hamill", "Mark") 
 RDF LIMIT_AXIS ANALOG:  0->Object_Value  1->Predicate_Name  2->Subject_URI  3->Graph_Name
 SPARQL: SELECT … WHERE { GRAPH <movies> {?s actor ?o . FILTER(?o IN ("Mark Hamill","Mark")) . ?s movie ?x . ?s rating ?r . FILTER(?r > 4)} }
 
-2. EXAMPLE JOIN QUERY
+2. VARIABLE EXAMPLE ACTOR NAME = MOVIE TITLE
+MEMELANG: $x=* actor * movies ; $x movie ;;
+SQL: SELECT ... FROM movies WHERE actor=movie
+
+3. EXAMPLE JOIN QUERY
 MEMELANG: "Mark Hamill" actor * movies ; * movie ; _ _ ! ; * actor ;;
+MEMELANG: "Mark Hamill" actor $row_id=* movies ; * movie ; _ _ !=$row_id ; * actor ;;
 SQL: SELECT co.actor FROM movies AS mh JOIN movies AS co ON co.movie=mh.movie AND co.row_id!=mh.row_id WHERE mh.actor='Mark Hamill';
 RDF: SELECT ?coActor WHERE { GRAPH <movies> { ?mhRow ex:actor "Mark Hamill" ; ex:movie ?movie . ?coRow ex:movie ?movie ; ex:actor ?coActor . FILTER ( ?coRow != ?mhRow ) } }
 '''
 
 import random, re, json
-from typing import List, Iterator, Iterable
+from typing import List, Iterator, Iterable, Dict, Tuple
 
 RAND_INT_MIN = 1 << 20
 RAND_INT_MAX = 1 << 53
@@ -26,7 +31,7 @@ RAND_INT_MAX = 1 << 53
 Axis = int # >=0
 Datum = str | float | int
 
-WILD, SAME, DIFF, SIGIL, EMPTY =  '*', '_', '!', '#', '\u2205'
+WILD, SAME, DIFF, EMPTY =  '*', '_', '!', '\u2205'
 
 SEP_LIMIT, SEP_DATA, SEP_VCTR, SEP_MTRX = ' ', ',', ';', ';;'
 SEP_VCTR_PRETTY, SEP_MTRX_PRETTY = ' ; ', ' ;;\n'
@@ -51,7 +56,7 @@ TOKEN_KIND_PATTERNS = (
 	('SAME',		re.escape(SAME)),	# EQUALS DATA FROM (LIMIT_AXIS, VCTR_AXIS-1)
 	('DIFF',		re.escape(DIFF)),	# NOT EQUALS DATA FROM (LIMIT_AXIS, VCTR_AXIS-1)
 	('EMPTY',		re.escape(EMPTY)),	# EMPTY SET, ANTI-WILD
-	('VAR',			rf'(?:{SIGIL}\d+){{1,3}}'),
+	('VAR',			rf'\$[A-Za-z0-9_]+'),
 	
 	('IDENT',		r'[A-Za-z][A-Za-z0-9_]*'), # ALPHANUMERIC IDENTIFIERS ARE UNQUOTED
 	('FLOAT',		r'-?\d*\.\d+'),
@@ -62,7 +67,8 @@ TOKEN_KIND_PATTERNS = (
 MASTER_PATTERN = re.compile('|'.join(f'(?P<{kind}>{pat})' for kind, pat in TOKEN_KIND_PATTERNS))
 
 OPR_KINDS = {'NOT','GE','LE','GT','LT','EQL'}
-DATUM_KINDS = {'IDENT', 'QUOTE', 'INT', 'FLOAT', 'VAR', 'SAME', 'DIFF', 'WILD', 'EMPTY'}
+SEP_KINDS = {'SEP_MTRX','SEP_VCTR','SEP_LIMIT','SEP_DATA',None}
+SUGAR_KINDS = {'DIFF', 'WILD'}
 DATA_KINDS = {'IDENT', 'QUOTE', 'INT', 'FLOAT', 'VAR', 'SAME', 'EMPTY'} # NEVER DIFF OR WILD IN MULTI-DATA LIST
 UNITARY_KINDS = {'IDENT', 'QUOTE', 'INT', 'FLOAT', 'EQL'}
 
@@ -90,7 +96,6 @@ class Token(Kind):
 TOK_EQL = Token('EQL', '=')
 TOK_NOT = Token('NOT', '!=')
 TOK_SAME = Token('SAME', SAME)
-TOK_WILD = Token('WILD', WILD)
 TOK_EMPTY = Token('EMPTY', EMPTY)
 
 
@@ -113,15 +118,19 @@ class Stream:
 
 
 class Branch(Kind):
+	kind: str = 'BRNCH'
 	sep: str
 	opr: Token
+	var: Token
 	children: List[Kind]
 	def __init__(self, opr: Token|None = None, children: List[Kind]|None = None):
 		if opr is None: opr = Token('EQL', '=')
 		if children is None: children = []
 		self.opr = opr
 		self.children = children
+		self.var = None
 
+	def reopr(self, opr: Token): self.opr = opr
 	def dump(self) -> List: return [self.opr.lexeme, [tok.datum for tok in self.children]]
 	def append(self, token: Kind): self.children.append(token)
 	def extend(self, tokens: List[Kind]): self.children.extend(tokens)
@@ -133,38 +142,54 @@ class Branch(Kind):
 
 
 class Limit(Branch):
-	kind: str = 'LIMIT'
 	sep: str = SEP_DATA
 	def check(self) -> 'Limit':
-		if len(self.children)>1 and self.opr.lexeme not in {'=','!='}: raise SyntaxError('E_DATA_OPR')
-		if self.children[0].kind not in DATUM_KINDS: raise SyntaxError('E_DATUM_TYPE')
-		if len(self.children)>1 and any(c.kind not in DATA_KINDS for c in self.children): raise SyntaxError('E_DATA_TYPE')
+
+		# DATA LIST
+		if len(self.children)>1:
+			if self.opr.kind not in {'EQL','NOT'}: raise SyntaxError('E_DATA_OPR')
+			if any(c.kind not in DATA_KINDS for c in self.children): raise SyntaxError('E_DATA_TYPE')
+
+		# DATUM
+		else:
+			kind = self.children[0].kind
+	
+			# DESUGAR EQL DIFF to NOT SAME
+			if kind == 'DIFF':
+				if self.opr.kind != 'EQL': raise SyntaxError('E_OPR')
+				self.opr = TOK_NOT
+				self.children = [TOK_SAME]
+
+			# DESUGAR EQL WILD to NOT EMPTY
+			elif kind == 'WILD':
+				if self.opr.kind != 'EQL': raise SyntaxError('E_OPR')
+				self.opr = TOK_NOT
+				self.children = [TOK_EMPTY]
+
+			elif kind not in DATA_KINDS: raise SyntaxError('E_DATA_TYPE')
+
+			# VAR MUST BIND TO NON-UNITARY QUERY
+			elif self.var and self.unitary: raise SyntaxError('E_VAR_UNI')
+
 		return self
 
-TOK_EQL_WILD = Limit(None, [TOK_WILD])
+	@property
+	def unitary(self) -> bool: return self.opr.unitary and len(self.children)==1 and self.children[0].unitary
+
+
 TOK_EQL_SAME = Limit(None, [TOK_SAME])
+TOK_NOT_EMPTY = Limit(TOK_NOT, [TOK_EMPTY])
 TOK_EQL_EMPTY = Limit(None, [TOK_EMPTY])
 
 
 class Vector(Branch):
-	kind: str = 'VCTR'
 	sep: str = SEP_LIMIT
 	children: List[Limit]
 
 
 class Matrix(Branch):
-	kind: str = 'MTRX'
 	sep = SEP_VCTR
 	children: List[Vector]
-	results: List[Vector]
-
-	def check(self) -> 'Matrix':
-		for vctr_axis, vctr in enumerate(self.children):
-			if not isinstance(vctr, Vector): raise TypeError('E_TYPE_VCTR')
-			if not all(isinstance(limit, Limit) for limit in vctr.children): raise TypeError('E_TYPE_LIMIT')
-
-		self.results = [[TOK_EQL_EMPTY for limit in vctr.children] for vctr in self.children]
-		return self
 
 	# HIGHER AXIS RESULTS CARRY FORWARD UNTIL END OF MATRIX
 	def cylindrify(self) -> None:
@@ -177,24 +202,7 @@ class Matrix(Branch):
 		for vctr_axis, vctr in enumerate(self.children):
 			cur_axis = len(vctr.children)-1
 			pad_wild = max_axis - cur_axis
-			if pad_wild>0: self.children[vctr_axis].children.extend([TOK_EQL_WILD] * pad_wild)
-
-
-	# STORE UNITARY DATA IN MEMORY
-	def store(self) -> None:
-		if not self.unitary: raise SyntaxError('E_UNI_MTRX')
-		self.cylindrify()
-		for vctr_axis, vctr in enumerate(self.children):
-			if not vctr.unitary: raise SyntaxError('E_UNI_VCTR')
-			for limit_axis, limit in enumerate(vctr.children):
-				if limit is TOK_EQL_WILD: self.results[vctr_axis][limit_axis] = Limit(None, [Token('INT', str(random.randrange(RAND_INT_MIN, RAND_INT_MAX)))])
-				elif limit is TOK_EQL_SAME:
-					if limit_axis == 0: raise SyntaxError('E_SAME_ZERO')
-					self.results[vctr_axis][limit_axis] = self.results[vctr_axis][limit_axis-1]
-				else: self.results[vctr_axis][limit_axis] = limit
-
-	def coord(self, limit_axis: Axis = 0, vctr_axis: Axis = 0) -> List[Token]:
-		return self.results[vctr_axis][limit_axis].children
+			if pad_wild>0: self.children[vctr_axis].children.extend([TOK_NOT_EMPTY] * pad_wild)
 
 
 def lex(src) -> Iterator[Token]:
@@ -209,103 +217,123 @@ def parse(src: str) -> Iterator[Matrix]:
 	tokens = Stream(lex(src))
 	mtrx=Matrix()
 	vctr=Vector()
-	while (kind:=tokens.peek()):
+	limit=Limit()
+	var = None
+	while tokens.peek():
 
-		# LIMIT ::= [OPR_KINDS] (DATUM_KINDS | DATA_KINDS (SEP_DATA DATA_KINDS)+)
+		# LIMIT ::= [[VAR] OPR] DATUM {SEP_DATA DATUM}
 		# Single axis constraint
-		if kind in OPR_KINDS|DATUM_KINDS:
-			opr=tokens.next() if kind in OPR_KINDS else TOK_EQL
-			while tokens.peek()=='SEP_LIMIT': tokens.next()
 
-			limit=Limit(opr)
+		# [VAR]
+		if tokens.peek() == 'VAR':
+			var = tokens.next()
+			# 1. VAR OPR -> $x=* -> bind
+			if tokens.peek() in OPR_KINDS: limit.var = var
+			# 2. VAR SEP_KINDS -> $x -> read
+			if tokens.peek() in SEP_KINDS:
+				limit.append(var)
+				if tokens.peek()=='SEP_DATA': tokens.next() # CONSUME COMMA
 
-			# First datum
-			if tokens.peek() not in DATUM_KINDS: raise SyntaxError('E_OPR_DATA')
+		# [OPR]
+		if tokens.peek() in OPR_KINDS:
+			limit.reopr(tokens.next())
+			if tokens.peek()=='SEP_LIMIT': raise SyntaxError('E_SPACE')
+			if tokens.peek() not in DATA_KINDS|SUGAR_KINDS: raise SyntaxError('E_COMMA')
+
+		# DATUM {SEP_DATA DATUM}
+		if tokens.peek() in DATA_KINDS|SUGAR_KINDS:
 			limit.append(tokens.next())
-
-			# Additional data (COMMA SEPARATED)
 			while tokens.peek()=='SEP_DATA':
 				tokens.next()
-				while tokens.peek()=='SEP_LIMIT': tokens.next()
+				if tokens.peek()=='SEP_LIMIT': raise SyntaxError('E_SPACE')
 				if tokens.peek() not in DATA_KINDS: raise SyntaxError('E_DATA_KIND')
 				limit.append(tokens.next())
-			vctr.append(limit.check())
-			continue
-
-		# VCTR  ::= LIMIT {SEP_LIMIT LIMIT}
-		# Conjunctive vector of axis constraints
-		if kind == 'SEP_VCTR':
-			tokens.next()
-			if vctr.children:
-				mtrx.append(vctr.check())
-				vctr = Vector()
-			continue
-
-		# MTRX  ::= VCTR {SEP_VCTR VCTR}
-		# Conjunctive matrix of axis constraints
-		if kind == 'SEP_MTRX':
-			tokens.next()
-			if vctr.children:
-				mtrx.append(vctr.check())
-				vctr = Vector()
-			if mtrx.children:
-				yield mtrx.check()
-				mtrx = Matrix()
-			continue
 
 		# Consume spaces
-		while tokens.peek()=='SEP_LIMIT': tokens.next()
+		if tokens.peek()=='SEP_LIMIT':
+			if limit.children: vctr.append(limit.check())
+			limit = Limit()
+			tokens.next()
+			continue
 
+		# VCTR ::= LIMIT {SEP_LIMIT LIMIT}
+		# Conjunctive vector of axis constraints
+		if tokens.peek() == 'SEP_VCTR':
+			if limit.children: vctr.append(limit.check())
+			if vctr.children: mtrx.append(vctr.check())
+			limit = Limit()
+			vctr = Vector()
+			tokens.next()
+			continue
+
+		# MTRX ::= VCTR {SEP_VCTR VCTR}
+		# Conjunctive matrix of axis constraints
+		if tokens.peek() == 'SEP_MTRX':
+			if limit.children: vctr.append(limit.check())
+			if vctr.children: mtrx.append(vctr.check())
+			if mtrx.children: yield mtrx.check()
+			limit = Limit()
+			vctr = Vector()
+			mtrx = Matrix()
+			tokens.next()
+			continue
+
+		raise SyntaxError('E_TOK')
+
+	if limit.children: vctr.append(limit.check())
 	if vctr.children: mtrx.append(vctr.check())
 	if mtrx.children: yield mtrx.check()
 
 
 class Meme(Branch):
-	kind: str = 'MEME'
 	sep: str = SEP_MTRX
 	children: List[Matrix]
+	results: List[List[List[List[Token]]]]
+	bindings: Dict[str, Tuple[Axis, Axis, Axis]]
 
 	def __init__(self, src: str):
 		self.src = src
+		self.bindings = {}
 		self.children = list(parse(src))
 
-	def cylindrify(self) -> None: for mtrx in self.children: mtrx.cylindrify()
-	def store(self): for mtrx in self.children: mtrx.store()
+	def cylindrify(self) -> None:
+		for mtrx in self.children: mtrx.cylindrify()
+		self.results = [[[[] for limit in vctr.children] for vctr in mtrx.children] for mtrx in self.children]
 
-	# VAR ::= SIGIL LIMIT [SIGIL VCTR [SIGIL MTRX]]]
-	# VARIABLES ARE AXIS COORDINATES OF PRIOR RESULTS
-	def expand(self, query_limit: Limit, from_limit_axis: Axis, from_vctr_axis: Axis, from_mtrx_axis: Axis) -> Limit:
-		expansion = Limit()
+	def store(self): 
+		for mtrx_axis, mtrx in enumerate(self.children):
+			if not mtrx.unitary: raise SyntaxError('E_UNI_MTRX')
+			for vctr_axis, vctr in enumerate(mtrx.children):
+				if not vctr.unitary: raise SyntaxError('E_UNI_VCTR')
+				for limit_axis, limit in enumerate(vctr.children):
+					if limit is TOK_NOT_EMPTY: self.results[mtrx_axis][vctr_axis][limit_axis] = [Token('INT', str(random.randrange(RAND_INT_MIN, RAND_INT_MAX)))]
+					elif limit is TOK_EQL_SAME:
+						if limit_axis == 0: raise SyntaxError('E_SAME_ZERO')
+						self.results[mtrx_axis][vctr_axis][limit_axis] = self.results[mtrx_axis][vctr_axis][limit_axis-1]
+					else: self.results[mtrx_axis][vctr_axis][limit_axis] = limit.children
 
-		for tok in query_limit.children:
+	def check(self) -> 'Meme':
+		for mxtr_axis, mtrx in enumerate(self.children):
+			if not isinstance(mtrx, Matrix): raise TypeError('E_TYPE_VCTR')
+			for vctr_axis, vctr in enumerate(mtrx.children):
+				if not isinstance(vctr, Vector): raise TypeError('E_TYPE_VCTR')
+				for limit_axis, limit in enumerate(vctr.children):
+					if not isinstance(limit, Limit): raise TypeError('E_TYPE_LIMIT')
+					if limit.var: self.bindings[limit.var.lexeme] = (mxtr_axis, vctr_axis, limit_axis)
 
-			if tok.kind=='DIFF':
-				if from_vctr_axis < 1: raise SyntaxError('E_DIFF_OOB')
-				return Limit(TOK_NOT, self.children[from_mtrx_axis].coord(from_limit_axis, from_vctr_axis-1))
+		self.results = [[[[] for limit in vctr.children] for vctr in mtrx.children] for mtrx in self.children]
 
-			elif tok.kind=='SAME':
+
+	def expand(self, tokens: List[Token], from_limit_axis: Axis, from_vctr_axis: Axis, from_mtrx_axis: Axis) -> List[Token]:
+		expansion: List[Token] = []
+		for tok in tokens:
+			if tok.kind == 'SAME':
 				if from_vctr_axis < 1: raise SyntaxError('E_SAME_OOB')
-				expansion.extend(self.children[from_mtrx_axis].coord(from_limit_axis, from_vctr_axis-1))
-
-			elif tok.kind=='VAR':
-				try: parts = [int(p) for p in tok.lexeme.lstrip(SIGIL).split(SIGIL)]
-				except ValueError: raise SyntaxError('E_VAR_PARSE')
-
-				if any(idx < 0 for idx in parts): raise SyntaxError('E_VAR_NEG')
-				if len(parts) > 3: raise SyntaxError('E_VAR_LONG') # NOT 4D YET
-
-				limit_axis = parts[0]
-				vctr_axis = from_vctr_axis if len(parts)<2 else parts[1]
-				mtrx_axis = from_mtrx_axis if len(parts)<3 else parts[2]
-
-				# ALWAYS VARIABLES REFERENCE *PRIOR* LIMITS
-				if (mtrx_axis, vctr_axis, limit_axis) >= (from_mtrx_axis, from_vctr_axis, from_limit_axis): raise SyntaxError('E_VAR_FWD')
-
-				try: expansion.extend(self.children[mtrx_axis].coord(limit_axis, vctr_axis))
-				except IndexError: raise SyntaxError('E_VAR_OOB')
-
+				expansion.extend(self.results[from_mtrx_axis][from_vctr_axis-1][from_limit_axis])
+			elif tok.kind == 'VAR':
+				axes = self.bindings[tok.lexeme]
+				expansion.extend(self.results[axes[0]][axes[1]][axes[2]])
 			else: expansion.append(tok)
-
 		return expansion
 
 
@@ -316,12 +344,6 @@ def intersect(query_limit: Limit, store_limit: Limit) -> Limit:
 	intersection = Limit()
 
 	query_opr, query_datums = query_limit.dump()
-
-	# INVERT WILD TO NOT EMPTY SET
-	if query_datums == [WILD]:
-		if query_opr == '=': query_opr = '!='
-		elif query_opr == '!=': query_opr = '='
-		query_datums = [EMPTY]
 
 	if query_opr == '=': intersection.extend([t for t in store_children if t.datum in query_datums])
 	elif query_opr == '!=': intersection.extend([t for t in store_children if t.datum not in query_datums])
