@@ -1,5 +1,5 @@
 '''
-Memelang v8.07 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
+Meme v8.08 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
 This script is optimized for training LLMs
 
 1. EXAMPLE QUERY
@@ -18,7 +18,7 @@ RDF: SELECT ?coActor WHERE { GRAPH <movies> { ?mhRow ex:actor "Mark Hamill" ; ex
 '''
 
 import random, re, json
-from typing import List
+from typing import List, Iterator, Iterable
 
 RAND_INT_MIN = 1 << 20
 RAND_INT_MAX = 1 << 53
@@ -37,7 +37,7 @@ TOKEN_KIND_PATTERNS = (
 
 	('SEP_MTRX',	re.escape(SEP_MTRX)),	# MTRX DISJUNCTION, AXIS=0
 	('SEP_VCTR',	re.escape(SEP_VCTR)),	# VCTR CONJUNCTION, AXIS=0
-	('SEP_LIMIT',	re.escape(SEP_LIMIT)),	# LIMIT CONJUNCTION, AXIS+=1
+	('SEP_LIMIT',	r'\s+'),				# LIMIT CONJUNCTION, AXIS+=1
 	('SEP_DATA',	re.escape(SEP_DATA)),	# DATUM DISJUNCTION, AXIS SAME
 
 	('NOT',			r'!='),
@@ -82,6 +82,9 @@ class Token(Kind):
 		elif kind == 'INT':		self.datum = int(lexeme)
 		else: 					self.datum = lexeme
 
+	@property
+	def unitary(self) -> bool: return self.kind in UNITARY_KINDS
+
 	def __str__(self) -> str: return self.lexeme
 
 TOK_EQL = Token('EQL', '=')
@@ -91,54 +94,63 @@ TOK_WILD = Token('WILD', WILD)
 TOK_EMPTY = Token('EMPTY', EMPTY)
 
 
-class Limit(Kind):
-	kind: str
+class Stream:
+	def __init__(self, token: Iterable[Token]):
+		self.token: Iterator[Token] = iter(token)
+		self.buffer: list[Token] = []
+	def peek(self) -> str|None: 
+		if not self.buffer:
+			val = next(self.token, None)
+			if val is None: return None
+			self.buffer.append(val)
+		return self.buffer[0].kind
+	def next(self) -> Token: 
+		if not self.buffer:
+			val = next(self.token, None)
+			if val is None: raise SyntaxError('E_EOF')
+			self.buffer.append(val)
+		return self.buffer.pop(0)
+
+
+class Branch(Kind):
+	sep: str
 	opr: Token
-	children: List[Token]
-	def __init__(self, opr: Token|None = None, children: List[Token]|None = None):
+	children: List[Kind]
+	def __init__(self, opr: Token|None = None, children: List[Kind]|None = None):
 		if opr is None: opr = Token('EQL', '=')
 		if children is None: children = []
-		self.kind = 'LIMIT'
 		self.opr = opr
 		self.children = children
 
-	def append(self, token: Token): self.children.append(token)
-	def extend(self, tokens: List[Token]): self.children.extend(tokens)
+	def dump(self) -> List: return [self.opr.lexeme, [tok.datum for tok in self.children]]
+	def append(self, token: Kind): self.children.append(token)
+	def extend(self, tokens: List[Kind]): self.children.extend(tokens)
+	def check(self) -> 'Branch': return self
+	def __str__(self) -> str: return ('' if self.opr.kind=='EQL' else self.opr.lexeme) + SEP_DATA.join(map(str, self.children))
+	
 	@property
-	def unitary(self) -> bool: return self.opr.kind in UNITARY_KINDS and all(tok.kind in UNITARY_KINDS for tok in self.children)
+	def unitary(self) -> bool: return self.opr.unitary and all(tok.unitary for tok in self.children)
+
+
+class Limit(Branch):
+	kind: str = 'LIMIT'
+	sep: str = SEP_DATA
 	def check(self) -> 'Limit':
 		if len(self.children)>1 and self.opr.lexeme not in {'=','!='}: raise SyntaxError('E_DATA_OPR')
 		if self.children[0].kind not in DATUM_KINDS: raise SyntaxError('E_DATUM_TYPE')
 		if len(self.children)>1 and any(c.kind not in DATA_KINDS for c in self.children): raise SyntaxError('E_DATA_TYPE')
 		return self
 
-	def dump(self) -> List: return [self.opr.lexeme, [tok.datum for tok in self.children]]
-	def __str__(self) -> str: return ('' if self.opr.kind=='EQL' else self.opr.lexeme) + SEP_DATA.join(map(str, self.children))
-
 TOK_EQL_WILD = Limit(None, [TOK_WILD])
 TOK_EQL_SAME = Limit(None, [TOK_SAME])
 TOK_EQL_EMPTY = Limit(None, [TOK_EMPTY])
-
-class Branch(Kind):
-	sep: str
-	children: list
-	def __init__(self):
-		self.children = []
-
-	def dump(self) -> list: return [child.dump() for child in self.children]
-	def append(self, token: Kind): self.children.append(token)
-	def extend(self, tokens: List[Kind]): self.children.extend(tokens)
-	def check(self) -> 'Branch': return self
-	def __str__(self) -> str: return self.sep.join(map(str, self.children))
-	
-	@property
-	def unitary(self) -> bool: return all(child.unitary for child in self.children)
 
 
 class Vector(Branch):
 	kind: str = 'VCTR'
 	sep: str = SEP_LIMIT
 	children: List[Limit]
+
 
 class Matrix(Branch):
 	kind: str = 'MTRX'
@@ -147,26 +159,26 @@ class Matrix(Branch):
 	results: List[Vector]
 
 	def check(self) -> 'Matrix':
+		for vctr_axis, vctr in enumerate(self.children):
+			if not isinstance(vctr, Vector): raise TypeError('E_TYPE_VCTR')
+			if not all(isinstance(limit, Limit) for limit in vctr.children): raise TypeError('E_TYPE_LIMIT')
+
 		self.results = [[TOK_EQL_EMPTY for limit in vctr.children] for vctr in self.children]
 		return self
 
 	# HIGHER AXIS RESULTS CARRY FORWARD UNTIL END OF MATRIX
 	def cylindrify(self) -> None:
-		max_axis_all: Axis = max(len(vctr.children) for vctr in self.children)-1
-		max_axis_sofar: Axis = 0
-	
+		max_axis: Axis = 0
 		for vctr_axis, vctr in enumerate(self.children):
-			if not isinstance(vctr, Vector): raise TypeError('E_TYPE_VCTR')
-			if not all(isinstance(limit, Limit) for limit in vctr.children): raise TypeError('E_TYPE_LIMIT')
-
 			cur_axis = len(vctr.children)-1
-
-			pad_same = max_axis_sofar - cur_axis
+			pad_same = max_axis - cur_axis
 			if pad_same>0: self.children[vctr_axis].children.extend([TOK_EQL_SAME] * pad_same)
-
-			max_axis_sofar = max(max_axis_sofar, cur_axis)
-			pad_wild = max_axis_all - max_axis_sofar
+			max_axis = max(max_axis, cur_axis)
+		for vctr_axis, vctr in enumerate(self.children):
+			cur_axis = len(vctr.children)-1
+			pad_wild = max_axis - cur_axis
 			if pad_wild>0: self.children[vctr_axis].children.extend([TOK_EQL_WILD] * pad_wild)
+
 
 	# STORE UNITARY DATA IN MEMORY
 	def store(self) -> None:
@@ -185,101 +197,77 @@ class Matrix(Branch):
 		return self.results[vctr_axis][limit_axis].children
 
 
-class Memelang(Branch):
+def lex(src) -> Iterator[Token]:
+	for m in MASTER_PATTERN.finditer(src):
+		kind = m.lastgroup
+		if kind == 'COMMENT': continue
+		if kind == 'MISMATCH': raise SyntaxError
+		yield Token(kind, m.group())
+
+
+def parse(src: str) -> Iterator[Matrix]:
+	tokens = Stream(lex(src))
+	mtrx=Matrix()
+	vctr=Vector()
+	while (kind:=tokens.peek()):
+
+		# LIMIT ::= [OPR_KINDS] (DATUM_KINDS | DATA_KINDS (SEP_DATA DATA_KINDS)+)
+		# Single axis constraint
+		if kind in OPR_KINDS|DATUM_KINDS:
+			opr=tokens.next() if kind in OPR_KINDS else TOK_EQL
+			while tokens.peek()=='SEP_LIMIT': tokens.next()
+
+			limit=Limit(opr)
+
+			# First datum
+			if tokens.peek() not in DATUM_KINDS: raise SyntaxError('E_OPR_DATA')
+			limit.append(tokens.next())
+
+			# Additional data (COMMA SEPARATED)
+			while tokens.peek()=='SEP_DATA':
+				tokens.next()
+				while tokens.peek()=='SEP_LIMIT': tokens.next()
+				if tokens.peek() not in DATA_KINDS: raise SyntaxError('E_DATA_KIND')
+				limit.append(tokens.next())
+			vctr.append(limit.check())
+			continue
+
+		# VCTR  ::= LIMIT {SEP_LIMIT LIMIT}
+		# Conjunctive vector of axis constraints
+		if kind == 'SEP_VCTR':
+			tokens.next()
+			if vctr.children:
+				mtrx.append(vctr.check())
+				vctr = Vector()
+			continue
+
+		# MTRX  ::= VCTR {SEP_VCTR VCTR}
+		# Conjunctive matrix of axis constraints
+		if kind == 'SEP_MTRX':
+			tokens.next()
+			if vctr.children:
+				mtrx.append(vctr.check())
+				vctr = Vector()
+			if mtrx.children:
+				yield mtrx.check()
+				mtrx = Matrix()
+			continue
+
+		# Consume spaces
+		while tokens.peek()=='SEP_LIMIT': tokens.next()
+
+	if vctr.children: mtrx.append(vctr.check())
+	if mtrx.children: yield mtrx.check()
+
+
+class Meme(Branch):
 	kind: str = 'MEME'
 	sep: str = SEP_MTRX
 	children: List[Matrix]
 
 	def __init__(self, src: str):
-		self.children = []
 		self.src = src
-		self.i=0
-
-		# TOKENS FROM TOKEN_KIND_PATTERNS
-		for m in MASTER_PATTERN.finditer(self.src):
-			kind = m.lastgroup
-			text = m.group()
-			if kind == 'COMMENT': continue
-			if kind == 'MISMATCH': raise SyntaxError(f'Unexpected char {text!r} at {m.start()}')
-			self.children.append(Token(kind, text))
-		self.length = len(self.children)
-
-		self.replace(list(self.pass_limit()))
-		self.replace(list(self.pass_vctr()))
-		self.replace(list(self.pass_mtrx()))
-		self.cylindrify()
-
-	def peek(self) -> str|None:
-		return self.children[self.i].kind if self.i < self.length else None
-
-	def next(self) -> Kind:
-		if self.i >= self.length: raise SyntaxError('E_EOF')
-		self.i += 1
-		return self.children[self.i-1]
-
-	def replace(self, children: List[Matrix]):
-		self.i = 0
-		self.children = children
-		self.length = len(children)
-
-	# DATA ::= DATUM_KINDS {SEP_DATA DATUM_KINDS}
-	# LIMIT ::= [OPR_KINDS] DATA
-	# Single axis constraint
-	def pass_limit(self) -> Token|Limit:
-		while self.peek():
-			if self.peek() in OPR_KINDS | DATUM_KINDS:
-				opr = TOK_EQL if self.peek() not in OPR_KINDS else self.next()
-				limit = Limit(opr)
-
-				while self.peek() == 'SEP_LIMIT': self.next() # AVOID SPACE AFTER OPERATOR
-				if self.peek() not in DATUM_KINDS: raise SyntaxError('E_OPR_DATA')
-
-				limit.append(self.next())
-
-				while self.peek() == 'SEP_DATA':
-					self.next()
-					while self.peek() == 'SEP_LIMIT': self.next() # AVOID SPACE AFTER COMMA
-					if self.peek() not in DATA_KINDS: raise SyntaxError('E_DATA_KIND')
-					limit.append(self.next())
-
-				yield limit.check()
-
-			elif self.peek() in {'SEP_LIMIT','SEP_VCTR','SEP_MTRX'}: yield self.next()
-			else: raise SyntaxError('E_TOK')
-
-	# VCTR ::= LIMIT {SEP_LIMIT LIMIT}
-	# Conjunctive vector of axis constraints
-	def pass_vctr(self) -> Token|Vector:
-		vctr = Vector()
-		while self.peek():
-			if self.peek() == 'LIMIT':
-				vctr.append(self.next())
-				if self.peek() == 'LIMIT': raise SyntaxError('E_SEP_LIMIT')
-
-			elif self.peek() in {None, 'SEP_VCTR', 'SEP_MTRX'}:
-				if vctr.children: yield vctr.check()
-				vctr = Vector()
-				if self.peek(): yield self.next()
-
-			elif self.peek() == 'SEP_LIMIT': self.next()
-			else: raise SyntaxError('E_TOK')
-
-		if vctr.children: yield vctr.check()
-
-	# MTRX ::= VCTR {SEP_VCTR VCTR}
-	# Conjunctive matrix of axis constraints
-	def pass_mtrx(self) -> Matrix:
-		mtrx = Matrix()
-		while self.peek():
-			if self.peek() == 'VCTR': mtrx.append(self.next())
-			elif self.peek() in {None, 'SEP_MTRX'}:
-				if mtrx.children: yield mtrx.check()
-				mtrx = Matrix()
-				if self.peek(): self.next()
-			elif self.peek() == 'SEP_VCTR': self.next()
-			else: raise SyntaxError('E_TOK')
-
-		if mtrx.children: yield mtrx.check()
+		self.children = list(parse(src))
 
 	def cylindrify(self) -> None: for mtrx in self.children: mtrx.cylindrify()
 	def store(self): for mtrx in self.children: mtrx.store()
