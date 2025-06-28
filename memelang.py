@@ -16,8 +16,8 @@ MEMELANG: movies * actor $x=* ; movie $x ;;
 SQL: SELECT ... FROM movies WHERE actor=movie
 
 4. EXAMPLE JOIN QUERY
-MEMELANG: movies * actor "Mark Hamill" ; movie * ; ! @ @ ; actor * ;;
-MEMELANG: movies $rowid=* actor "Mark Hamill" ; movie * ; !=$rowid @ @ ; actor * ;;
+MEMELANG: movies * actor "Mark Hamill" ; movie * ; ~ @ @ ; actor * ;;
+MEMELANG: movies $rowid=* actor "Mark Hamill" ; movie * ; !$rowid @ @ ; actor !"Mark Hamill" ;;
 SQL: SELECT co.actor FROM movies AS mh JOIN movies AS co ON co.movie=mh.movie AND co.rowid!=mh.rowid WHERE mh.actor='Mark Hamill';
 RDF: SELECT ?coActor WHERE { GRAPH <movies> { ?mhRow ex:actor "Mark Hamill" ; ex:movie ?movie . ?coRow ex:movie ?movie ; ex:actor ?coActor . FILTER ( ?coRow != ?mhRow ) } }
 '''
@@ -31,7 +31,7 @@ RAND_INT_MAX = 1 << 53
 Axis = int # >=0
 Datum = Union[str, float, int]
 
-SIGIL, WILD, SAME, DIFF, EMPTY, EOF =  '$', '*', '@', '!', '_', None
+SIGIL, WILD, SAME, DIFF, EMPTY, EOF =  '$', '*', '@', '~', '_', None
 
 SEP_LIMIT, SEP_DATA, SEP_VCTR, SEP_MTRX = ' ', ',', ';', ';;'
 SEP_VCTR_PRETTY, SEP_MTRX_PRETTY = ' ; ', ' ;;\n'
@@ -45,12 +45,12 @@ TOKEN_KIND_PATTERNS = (
 	('SEP_LIMIT',	r'\s+'),				# LIMIT CONJUNCTION, AXIS+=1
 	('SEP_DATA',	re.escape(SEP_DATA)),	# DATUM DISJUNCTION, AXIS SAME
 
-	('NOT',			r'!='),
 	('GE',			r'>='),
 	('LE',			r'<='),
+	('EQL',			r'='),
+	('NOT',			r'!'),
 	('GT',			r'>'),
 	('LT',			r'<'),
-	('EQL',			r'='),
 
 	('WILD',		re.escape(WILD)),		# WILDCARD, NEVER QUOTE
 	('SAME',		re.escape(SAME)),		# EQUALS DATA FROM (VCTR_AXIS-1, LIMIT_AXIS)
@@ -94,7 +94,7 @@ class Token():
 TOK_EQL = Token('EQL', '') # ELIDED '='
 TOK_DATUM = Token('DATUM', '') # ELIDED
 TOK_NOVAR = Token('NOVAR', '') # ELIDED
-TOK_NOT = Token('NOT', '!=')
+TOK_NOT = Token('NOT', '!')
 TOK_GT = Token('GT', '>')
 TOK_SEP_DATA = Token('SEP_DATA', SEP_DATA)
 TOK_SEP_LIMIT = Token('SEP_LIMIT', SEP_LIMIT)
@@ -322,7 +322,7 @@ def intersect(query: Limit, store: Data) -> Data:
 Table, Column, SqlOperator, Value = str, str, str, Any
 def demo_translate(table: Table, covs:List[Tuple[Column, SqlOperator, Value]]) -> Tuple[str, str]:
 	if not covs: raise ValueError('covs')
-	if any(isinstance(val,(list,tuple)) and opr.lower() not in ('=','!=','in','not in') for _,opr,val in covs): raise SyntaxError('data')
+	if any(isinstance(val,(list,tuple)) and opr.lower() not in ('in','not in') for _,opr,val in covs): raise SyntaxError('data')
 
 	def sql_opr(opr: SqlOperator) -> SqlOperator:
 		if opr.lower() not in {'=','!=','>','>=','<','<=','in','not in'}: raise SyntaxError('opr')
@@ -334,7 +334,7 @@ def demo_translate(table: Table, covs:List[Tuple[Column, SqlOperator, Value]]) -
 
 	def memelang_opr(opr:SqlOperator) -> SqlOperator:
 		if opr.lower() in ('=', 'in'): opr=''
-		elif opr.lower() == 'not in': opr='!='
+		elif opr.lower() in ('!=', 'not in'): opr='!'
 		return opr
 	
 	def memelang_val(val: Value) -> Value:
@@ -369,10 +369,10 @@ def demo_generate() -> Meme:
 		do_assign_variable = random.randint(0, 1)
 		if do_assign_variable: var += rand_datum('VAR',3)
 
-		opr: SqlOperator = random.choice(['=','!=','>','<','<=','>='])
+		opr = random.choice(['=','!','>','<','<=','>='])
 
 		data: Value = ''
-		if opr in {'=','!='}:
+		if opr in {'=','!'}:
 			data_list_len = random.randint(1, 5)
 			data_list: List[Any] = []
 			for _ in range(data_list_len):
