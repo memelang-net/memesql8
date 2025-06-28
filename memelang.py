@@ -1,23 +1,23 @@
 '''
-Meme v8.11 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
+Meme v8.12 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
 This script is optimized for training LLMs
 
-1. MEMELANG USES AXES
-SQL LIMIT_AXIS ANALOG:  0->Value  1->Column_Name  2->Row_Primary_Key  3->Table_Name
-RDF LIMIT_AXIS ANALOG:  0->Object_Value  1->Predicate_Name  2->Subject_URI  3->Graph_Name
+1. MEMELANG USES AXES, LIMIT_AXIS HIGH -> LOW
+SQL ANALOG:  3->Table_Name  2->Row_Primary_Key  1->Column_Name     0->Value
+RDF ANALOG:  3->Graph_Name  2->Subject_URI      1->Predicate_Name  0->Object_Value
 
 2. EXAMPLE QUERY
-MEMELANG: "Mark Hamill",Mark actor * movies ; * movie ; >4 rating ;;
+MEMELANG: movies * actor "Mark Hamill",Mark ; movie * ; rating >4 ;;
 SQL: SELECT ... FROM movies WHERE rowid=* AND actor IN ("Mark Hamill", "Mark") AND movie=* AND rating>4
 SPARQL: SELECT … WHERE { GRAPH <movies> {?s actor ?o . FILTER(?o IN ("Mark Hamill","Mark")) . ?s movie ?x . ?s rating ?r . FILTER(?r > 4)} }
 
 3. VARIABLE EXAMPLE ACTOR NAME = MOVIE TITLE
-MEMELANG: $x=* actor * movies ; $x movie ;;
+MEMELANG: movies * actor $x=* ; movie $x ;;
 SQL: SELECT ... FROM movies WHERE actor=movie
 
 4. EXAMPLE JOIN QUERY
-MEMELANG: "Mark Hamill" actor * movies ; * movie ; @ @ ! ; * actor ;;
-MEMELANG: "Mark Hamill" actor $rowid=* movies ; * movie ; @ @ !=$rowid ; * actor ;;
+MEMELANG: movies * actor "Mark Hamill" ; movie * ; ! @ @ ; actor * ;;
+MEMELANG: movies $rowid=* actor "Mark Hamill" ; movie * ; !=$rowid @ @ ; actor * ;;
 SQL: SELECT co.actor FROM movies AS mh JOIN movies AS co ON co.movie=mh.movie AND co.rowid!=mh.rowid WHERE mh.actor='Mark Hamill';
 RDF: SELECT ?coActor WHERE { GRAPH <movies> { ?mhRow ex:actor "Mark Hamill" ; ex:movie ?movie . ?coRow ex:movie ?movie ; ex:actor ?coActor . FILTER ( ?coRow != ?mhRow ) } }
 '''
@@ -53,8 +53,8 @@ TOKEN_KIND_PATTERNS = (
 	('EQL',			r'='),
 
 	('WILD',		re.escape(WILD)),		# WILDCARD, NEVER QUOTE
-	('SAME',		re.escape(SAME)),		# EQUALS DATA FROM (LIMIT_AXIS, VCTR_AXIS-1)
-	('DIFF',		re.escape(DIFF)),		# NOT EQUALS DATA FROM (LIMIT_AXIS, VCTR_AXIS-1)
+	('SAME',		re.escape(SAME)),		# EQUALS DATA FROM (VCTR_AXIS-1, LIMIT_AXIS)
+	('DIFF',		re.escape(DIFF)),		# NOT EQUALS DATA FROM (VCTR_AXIS-1, LIMIT_AXIS)
 	('EMPTY',		re.escape(EMPTY)),		# EMPTY SET, ANTI-WILD
 	('VAR',			rf'\$[A-Za-z0-9]+'),
 	
@@ -129,9 +129,9 @@ class Olist(list):
 	def pad(self, padding:Olist|Token) -> None:
 		max_len = len(self[0])
 		for idx, item in enumerate(self):
-			pad = max_len - len(item)
-			if pad>0: self[idx].extend([padding] * pad)
-			elif pad<0: raise SyntaxError('E_PAD')
+			diff = max_len - len(item)
+			if diff>0: self[idx][:0] = [padding] * diff
+			elif diff<0: raise SyntaxError('E_PAD')
 
 	@property
 	def unitary(self) -> bool: return self.opr.unitary and all(item.unitary for item in self)
@@ -210,6 +210,7 @@ def parse(src: str) -> Iterator[Matrix]:
 		# VCTR ::= LIMIT {SEP_LIMIT LIMIT}
 		# Conjunctive vector of axis constraints
 		if tokens.peek() == 'SEP_VCTR':
+			vctr.reverse() # LIMIT_AXIS: HIGH -> LOW
 			if vctr: mtrx.append(vctr.check())
 			vctr = Vector()
 			tokens.next()
@@ -218,6 +219,7 @@ def parse(src: str) -> Iterator[Matrix]:
 		# MTRX ::= VCTR {SEP_VCTR VCTR}
 		# Conjunctive matrix of axis constraints
 		if tokens.peek() == 'SEP_MTRX':
+			vctr.reverse() # LIMIT_AXIS: HIGH -> LOW
 			if vctr: mtrx.append(vctr.check())
 			if mtrx: yield mtrx.check()
 			vctr = Vector()
@@ -231,7 +233,9 @@ def parse(src: str) -> Iterator[Matrix]:
 
 		raise SyntaxError('E_TOK')
 
-	if vctr: mtrx.append(vctr.check())
+	if vctr:
+		vctr.reverse() # LIMIT_AXIS: HIGH -> LOW
+		mtrx.append(vctr.check())
 	if mtrx: yield mtrx.check()
 
 
@@ -250,9 +254,9 @@ class Meme(Olist):
 			for vctr_axis, vctr in enumerate(mtrx):
 				for limit_axis, limit in enumerate(vctr):
 					if not limit.unitary: raise SyntaxError('E_LIMIT_UNIT')
-					if limit is LIMIT_EQL_SAME:
+					if limit.dump() == LIMIT_EQL_SAME.dump():
 						if limit_axis == 0: raise SyntaxError('E_SAME_ZERO')
-						self.results[mtrx_axis][vctr_axis][limit_axis].extend(self.results[mtrx_axis][vctr_axis][limit_axis-1])
+						self.results[mtrx_axis][vctr_axis][limit_axis].extend(self.results[mtrx_axis][vctr_axis-1][limit_axis])
 					else: self.results[mtrx_axis][vctr_axis][limit_axis].extend(limit[1])
 
 	def check(self) -> 'Meme':
@@ -342,7 +346,8 @@ def demo_translate(table: Table, covs:List[Tuple[Column, SqlOperator, Value]]) -
 	sql = 'SELECT ' + ','.join([col for col,_,_ in covs]) + ' FROM ' + table + ' WHERE ' + ' AND '.join(sql_predicates) + ';'
 	
 	memelang_predicates=[[memelang_opr(opr) + memelang_val(val), memelang_opr('=') + col] for col,opr,val in covs]
-	memelang_predicates[0].extend([WILD,table])
+	memelang_predicates[0].insert(0, table)
+	memelang_predicates[0].insert(1, WILD)
 	memelang = SEP_VCTR_PRETTY.join(SEP_LIMIT.join(p) for p in memelang_predicates) + SEP_MTRX_PRETTY
 
 	return sql, str(Meme(memelang))
@@ -391,7 +396,4 @@ def demo_generate() -> Meme:
 
 		vector.append(var + opr + data)
 
-
-	memelang = SEP_VCTR_PRETTY.join(vector) + SEP_MTRX_PRETTY
-
-	return Meme(memelang)
+	return str(Meme(SEP_VCTR.join(vector) + SEP_MTRX))
