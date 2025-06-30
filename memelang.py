@@ -1,5 +1,5 @@
 '''
-Meme v8.12 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
+Meme v8.13 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
 This script is optimized for training LLMs
 
 1. MEMELANG USES AXES, LIMIT_AXIS HIGH -> LOW
@@ -31,20 +31,21 @@ RAND_INT_MAX = 1 << 53
 Axis = int # >=0
 Datum = Union[str, float, int]
 
-SIGIL, WILD, SAME, DIFF, EMPTY, EOF =  '$', '*', '@', '~', '_', None
-
+SIGIL, WILD, MSAME, VSAME, VDIFF, EMPTY, EOF =  '$', '*', '^', '@', '~', '_', None
 SEP_LIMIT, SEP_DATA, SEP_VCTR, SEP_MTRX = ' ', ',', ';', ';;'
 SEP_VCTR_PRETTY, SEP_MTRX_PRETTY = ' ; ', ' ;;\n'
 
 TOKEN_KIND_PATTERNS = (
 	('COMMENT',		r'//[^\n]*'),
 	('QUOTE',		r'"(?:[^"\\]|\\.)*"'),	# ALWAYS JSON QUOTE ESCAPE EXOTIC CHARS name="John \"Jack\" Kennedy"
+	('META',		r"'[^']*'"),
+	('IGNORE',		r'-*\|'),
 
 	('SEP_MTRX',	re.escape(SEP_MTRX)),	# MTRX DISJUNCTION, AXIS=0
 	('SEP_VCTR',	re.escape(SEP_VCTR)),	# VCTR CONJUNCTION, AXIS=0
 	('SEP_LIMIT',	r'\s+'),				# LIMIT CONJUNCTION, AXIS+=1
 	('SEP_DATA',	re.escape(SEP_DATA)),	# DATUM DISJUNCTION, AXIS SAME
-
+	
 	('GE',			r'>='),
 	('LE',			r'<='),
 	('EQL',			r'='),
@@ -52,9 +53,10 @@ TOKEN_KIND_PATTERNS = (
 	('GT',			r'>'),
 	('LT',			r'<'),
 
-	('WILD',		re.escape(WILD)),		# WILDCARD, NEVER QUOTE
-	('SAME',		re.escape(SAME)),		# EQUALS DATA FROM (VCTR_AXIS-1, LIMIT_AXIS)
-	('DIFF',		re.escape(DIFF)),		# NOT EQUALS DATA FROM (VCTR_AXIS-1, LIMIT_AXIS)
+	('WILD',		re.escape(WILD)),		# WILDCARD, MATCHES WHOLE VALUE, NEVER QUOTE
+	('MSAME',		re.escape(MSAME)),		# REFERENCES (MTRX_AXIS-1, VCTR_AXIS=-1, LIMIT_AXIS)
+	('VSAME',		re.escape(VSAME)),		# REFERENCES (MTRX_AXIS,   VCTR_AXIS-1,  LIMIT_AXIS)
+	('VDIFF',		re.escape(VDIFF)),		# ANTI-REFERENCES (MTRX_AXIS, VCTR_AXIS-1, LIMIT_AXIS)
 	('EMPTY',		re.escape(EMPTY)),		# EMPTY SET, ANTI-WILD
 	('VAR',			rf'\$[A-Za-z0-9]+'),
 	
@@ -64,14 +66,15 @@ TOKEN_KIND_PATTERNS = (
 	('MISMATCH',	r'.'),
 )
 
+
 MASTER_PATTERN = re.compile('|'.join(f'(?P<{kind}>{pat})' for kind, pat in TOKEN_KIND_PATTERNS))
 
 OPR_DICT = {'EQL': operator.eq, 'NOT': operator.ne, 'GT': operator.gt, 'GE': operator.ge, 'LT': operator.lt, 'LE': operator.le}
 OPR_DATA_KINDS = {'EQL','NOT'}
 SEP_KINDS = {'SEP_MTRX','SEP_VCTR','SEP_LIMIT','SEP_DATA',EOF}
-SUGAR_KINDS = {'DIFF', 'WILD'}
-DATA_KINDS = {'IDENT', 'QUOTE', 'INT', 'FLOAT', 'VAR', 'SAME', 'EMPTY'} # NEVER DIFF OR WILD IN MULTI-DATA LIST
-UNITARY_KINDS = {'IDENT', 'QUOTE', 'INT', 'FLOAT', 'EQL', 'DATUM', 'NOVAR', 'SAME'}
+SUGAR_KINDS = {'VDIFF', 'WILD'}
+DATA_KINDS = {'IDENT', 'QUOTE', 'INT', 'FLOAT', 'VAR', 'VSAME', 'MSAME', 'EMPTY'} # NEVER VDIFF OR WILD IN MULTI-DATA LIST
+UNITARY_KINDS = {'IDENT', 'QUOTE', 'INT', 'FLOAT', 'EQL', 'DATUM', 'NOVAR', 'VSAME', 'MSAME'}
 
 class Token():
 	kind: str
@@ -126,12 +129,15 @@ class Olist(list):
 		super().__init__(items)
 		if opr is not None: self.opr = opr
 
+	def prepend(self, item):
+		self.insert(0, item)
+
 	def pad(self, padding:Olist|Token) -> None:
 		max_len = len(self[0])
 		for idx, item in enumerate(self):
 			diff = max_len - len(item)
 			if diff>0: self[idx][:0] = [padding] * diff
-			elif diff<0: raise SyntaxError('E_PAD')
+			elif diff<0: raise SyntaxError('E_PAD') # FIRST VCTR MUST BE LONGEST
 
 	@property
 	def unitary(self) -> bool: return self.opr.unitary and all(item.unitary for item in self)
@@ -144,29 +150,31 @@ class Olist(list):
 class Data(Olist):
 	opr: Token = TOK_DATUM
 
-class Vector(Olist):
-	opr: Token = TOK_SEP_LIMIT
-
 class Limit(Olist):
 	opr: Token = TOK_EQL # ELIDED '='
+
+class Vector(Olist):
+	opr: Token = TOK_SEP_LIMIT
 
 class Matrix(Olist):
 	opr: Token = TOK_SEP_VCTR
 
-DATA_SAME = Data(Token('SAME', SAME))
+DATA_MSAME = Data(Token('MSAME', MSAME))
+DATA_VSAME = Data(Token('VSAME', VSAME))
 DATA_EMPTY = Data(Token('EMPTY', EMPTY))
-LIMIT_EQL_SAME = Limit(TOK_NOVAR, DATA_SAME, opr=TOK_EQL)
+LIMIT_EQL_VSAME = Limit(TOK_NOVAR, DATA_VSAME, opr=TOK_EQL)
 
 def lex(src) -> Iterator[Token]:
 	for m in MASTER_PATTERN.finditer(src):
 		kind = m.lastgroup
-		if kind == 'COMMENT': continue
-		if kind == 'MISMATCH': raise SyntaxError
+		if kind in {'COMMENT','META','IGNORE'}: continue
+		if kind == 'MISMATCH': raise SyntaxError('E_TOK')
 		yield Token(kind, m.group())
 
 
 def parse(src: str) -> Iterator[Matrix]:
 	tokens = Stream(lex(src))
+	bound_vars = []
 	mtrx=Matrix()
 	vctr=Vector()
 	limit=Limit()
@@ -178,13 +186,15 @@ def parse(src: str) -> Iterator[Matrix]:
 		# [VAR]
 		var = TOK_NOVAR
 		if tokens.peek() == 'VAR':
-			if tokens.peek(2) in OPR_DICT: var = tokens.next()
+			if tokens.peek(2) in OPR_DICT: 
+				var = tokens.next()
+				bound_vars.append(var.lexeme)
 			elif tokens.peek(2) not in SEP_KINDS: raise SyntaxError('E_VAR_NXT')
 
 		# [OPR]
 		if tokens.peek() in OPR_DICT:
 			limit.opr=tokens.next()
-			if tokens.peek()=='SEP_LIMIT': raise SyntaxError('E_SPACE')
+			if tokens.peek()=='SEP_LIMIT': raise SyntaxError('E_NEVER_SPACE_AFTER_OPR')
 			if tokens.peek() not in DATA_KINDS|SUGAR_KINDS: raise SyntaxError('E_OPR_DAT')
 
 		# DATUM {SEP_DATA DATUM}
@@ -192,25 +202,27 @@ def parse(src: str) -> Iterator[Matrix]:
 			data=Data()
 			data.append(tokens.next())
 			while tokens.peek()=='SEP_DATA':
-				if len(data)==1:
-					if data[0].kind not in DATA_KINDS: raise SyntaxError('E_DATA_KIND')
-					if limit.opr.kind not in OPR_DATA_KINDS: raise SyntaxError('E_DATA_OPR')
 				data.opr = tokens.next()
-				if tokens.peek()=='SEP_LIMIT': raise SyntaxError('E_SPACE')
+				if tokens.peek()=='SEP_LIMIT': raise SyntaxError('E_NEVER_SPACE_AFTER_COMMA')
 				if tokens.peek() not in DATA_KINDS: raise SyntaxError('E_DATA_KIND')
 				data.append(tokens.next())
 
-			# Finalize LIMIT
+			# LOGIC CHECKS
+			if any(t.kind == 'VAR' and t.lexeme not in bound_vars for t in data): raise SyntaxError('E_VAR_UNDEF')
+			if len(mtrx)==0 and any(t.kind == 'VSAME' for t in data): raise SyntaxError('E_VSAME_OOB')
+			if len(data)>1 and any(data.kind in SUGAR_KINDS): raise SyntaxError('E_DATA_KIND')
+			if len(data)>1 limit.opr.kind not in OPR_DATA_KINDS: raise SyntaxError('E_DATA_OPR')
+
+			# FINALIZE LIMIT
 			limit.append(var)
 			limit.append(data)
-			vctr.append(limit.check())
+			vctr.prepend(limit.check()) # LIMIT_AXIS: HIGH -> LOW
 			limit=Limit()
 			continue
 
 		# VCTR ::= LIMIT {SEP_LIMIT LIMIT}
 		# Conjunctive vector of axis constraints
 		if tokens.peek() == 'SEP_VCTR':
-			vctr.reverse() # LIMIT_AXIS: HIGH -> LOW
 			if vctr: mtrx.append(vctr.check())
 			vctr = Vector()
 			tokens.next()
@@ -219,7 +231,6 @@ def parse(src: str) -> Iterator[Matrix]:
 		# MTRX ::= VCTR {SEP_VCTR VCTR}
 		# Conjunctive matrix of axis constraints
 		if tokens.peek() == 'SEP_MTRX':
-			vctr.reverse() # LIMIT_AXIS: HIGH -> LOW
 			if vctr: mtrx.append(vctr.check())
 			if mtrx: yield mtrx.check()
 			vctr = Vector()
@@ -234,7 +245,6 @@ def parse(src: str) -> Iterator[Matrix]:
 		raise SyntaxError('E_TOK')
 
 	if vctr:
-		vctr.reverse() # LIMIT_AXIS: HIGH -> LOW
 		mtrx.append(vctr.check())
 	if mtrx: yield mtrx.check()
 
@@ -254,8 +264,8 @@ class Meme(Olist):
 			for vctr_axis, vctr in enumerate(mtrx):
 				for limit_axis, limit in enumerate(vctr):
 					if not limit.unitary: raise SyntaxError('E_LIMIT_UNIT')
-					if limit.dump() == LIMIT_EQL_SAME.dump():
-						if limit_axis == 0: raise SyntaxError('E_SAME_ZERO')
+					if limit.dump() == LIMIT_EQL_VSAME.dump():
+						if limit_axis == 0: raise SyntaxError('E_VSAME_ZERO')
 						self.results[mtrx_axis][vctr_axis][limit_axis].extend(self.results[mtrx_axis][vctr_axis-1][limit_axis])
 					else: self.results[mtrx_axis][vctr_axis][limit_axis].extend(limit[1])
 
@@ -267,7 +277,7 @@ class Meme(Olist):
 				for limit_axis, limit in enumerate(vctr):
 					if not isinstance(limit, Limit): raise TypeError('E_TYPE_LIMIT')
 					if limit[0].kind=='VAR': self.bindings[limit[0].lexeme] = (mtrx_axis, vctr_axis, limit_axis)
-			self[mtrx_axis].pad(LIMIT_EQL_SAME)
+			self[mtrx_axis].pad(LIMIT_EQL_VSAME)
 
 		self.results = [[[[] for limit in vctr] for vctr in mtrx] for mtrx in self]
 
@@ -275,9 +285,12 @@ class Meme(Olist):
 	def expand(self, data: Data, from_limit_axis: Axis, from_vctr_axis: Axis, from_mtrx_axis: Axis) -> Data:
 		expansion=Data()
 		for tok in data:
-			if tok.kind == 'SAME':
-				if from_vctr_axis < 1: raise SyntaxError('E_SAME_OOB')
+			if tok.kind == 'VSAME':
+				if from_vctr_axis < 1: raise SyntaxError('E_VSAME_OOB')
 				expansion.extend(self.results[from_mtrx_axis][from_vctr_axis-1][from_limit_axis])
+			elif tok.kind == 'MSAME':
+				if from_mtrx_axis < 1: raise SyntaxError('E_MSAME_OOB')
+				expansion.extend(self.results[from_mtrx_axis-1][-1][from_limit_axis])
 			elif tok.kind == 'VAR':
 				if tok.lexeme not in self.bindings: raise SyntaxError('E_VAR_BIND')
 				axes = self.bindings[tok.lexeme]
@@ -288,9 +301,9 @@ class Meme(Olist):
 
 
 def desugar(limit: Limit) -> Limit:
-	if limit[1][0].kind == 'DIFF':
-		if limit.opr.kind != 'EQL': raise SyntaxError('E_OPR_DIFF')
-		return Limit(limit[0], DATA_SAME, opr=TOK_NOT)
+	if limit[1][0].kind == 'VDIFF':
+		if limit.opr.kind != 'EQL': raise SyntaxError('E_OPR_VDIFF')
+		return Limit(limit[0], DATA_VSAME, opr=TOK_NOT)
 	if limit[1][0].kind == 'WILD':
 		if limit.opr.kind == 'EQL': opr=TOK_NOT
 		elif limit.opr.kind == 'NOT': opr=TOK_EQL
@@ -318,6 +331,15 @@ def intersect(query: Limit, store: Data) -> Data:
 
 
 # BELOW ARE DEMO FUNCTIONS FOR LLM TRAINING
+
+
+def rand_datum(kind:str, i:int=1) -> str:
+	if kind=='IDENT': return ''.join(random.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(i))
+	if kind=='QUOTE': return json.dumps(''.join(random.choice(' -_+,./<>[]{}\'"!@#$%^&*()abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(i)))
+	if kind=='INT': return str(random.randint(-i, i))
+	if kind=='FLOAT': return str(random.uniform(-i, i))
+	if kind=='VAR': return SIGIL + rand_datum('IDENT', i)
+
 
 Table, Column, SqlOperator, Value = str, str, str, Any
 def demo_translate(table: Table, covs:List[Tuple[Column, SqlOperator, Value]]) -> Tuple[str, str]:
@@ -352,16 +374,9 @@ def demo_translate(table: Table, covs:List[Tuple[Column, SqlOperator, Value]]) -
 
 	return sql, str(Meme(memelang))
 
-def demo_generate() -> Meme:
-	def rand_datum(kind:str, i:int=1) -> str:
-		if kind=='IDENT': return ''.join(random.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(i))
-		if kind=='QUOTE': return json.dumps(''.join(random.choice(' -_+,./<>[]{}\'"!@#$%^&*()abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(i)))
-		if kind=='INT': return str(random.randint(-100, 100))
-		if kind=='FLOAT': return str(random.uniform(-100, 100))
-		if kind=='VAR': return SIGIL + rand_datum('IDENT', 3)
 
-	prior_vars = []
-	vector = []
+def demo_generate() -> str:
+	bound_vars, vector = [], []
 
 	limit_len = random.randint(2, 10)
 	for _ in range(limit_len):
@@ -377,12 +392,12 @@ def demo_generate() -> Meme:
 			data_list: List[Any] = []
 			for _ in range(data_list_len):
 				datum_type = random.randint(1, 10)
-				if datum_type == 1:  data_list.append(rand_datum('QUOTE',5))
-				elif datum_type == 2:  data_list.append(rand_datum('INT'))
-				elif datum_type == 3:  data_list.append(rand_datum('FLOAT'))
-				elif datum_type == 4 and prior_vars: data_list.append(random.choice(prior_vars))
-				elif datum_type == 5 and vector: data_list.append(SAME)
-				elif datum_type == 6 and vector and opr == '=' and data_list_len == 1: data_list.append(DIFF)
+				if datum_type == 1:  data_list.append(rand_datum('QUOTE',10))
+				elif datum_type == 2:  data_list.append(rand_datum('INT', 100))
+				elif datum_type == 3:  data_list.append(rand_datum('FLOAT', 100))
+				elif datum_type == 4 and bound_vars: data_list.append(random.choice(bound_vars))
+				elif datum_type == 5 and vector: data_list.append(VSAME)
+				elif datum_type == 6 and vector and opr == '=' and data_list_len == 1: data_list.append(VDIFF)
 				else: data_list.append(rand_datum('IDENT', 5))
 			data += SEP_DATA.join(data_list)
 
@@ -391,9 +406,41 @@ def demo_generate() -> Meme:
 
 		if var:
 			assert opr
-			prior_vars.append(var)
+			bound_vars.append(var)
 		elif not var and opr == '=': opr = '' # ELIDED '='
 
 		vector.append(var + opr + data)
 
 	return str(Meme(SEP_VCTR.join(vector) + SEP_MTRX))
+
+
+def translate_sql_output(sql_output:str) -> str:
+	lines=[l for l in sql_output.splitlines() if l.startswith('|')]
+	if not lines:return ''
+	header=[c.strip() for c in lines[0].strip('|').split('|')]
+	mtrxs=[]
+	for line in lines[1:]:
+		cells=[c.strip() for c in line.strip('|').split('|')]
+		if len(cells)!=len(header):continue
+		id_val=cells[0]
+		parts=[f'{header[i]} {cells[i]}' for i in range(1,len(header))]
+		mtrxs.append(f'$rowid={id_val} ' + SEP_VCTR.join(parts))
+	return str(Meme(SEP_MTRX.join(mtrxs)))
+
+
+def translate_sql_insert(sql_insert:str) -> str:
+	m = re.search(r'INSERT\s+INTO\s+(\w+)\s*\((.*?)\)\s*VALUES\s*(.*);', sql_insert, re.I | re.S)
+	if not m: return ''
+	table = m.group(1)
+	header = [h.strip() for h in m.group(2).split(',')]
+	rows_sql = re.findall(r'\(([^()]*)\)', m.group(3))
+	mtrxs = []
+	for idx, row in enumerate(rows_sql):
+		cells = [c.strip(" '\"") for c in re.findall(r"'[^']*'|[^,]+", row)]
+		if len(cells) != len(header): continue
+		rowid = cells[0]
+		col_tokens = header[1:] if idx == 0 else [MSAME] * (len(header) - 1)
+		parts = [f'{col_tokens[i]} {cells[i + 1]}' for i in range(len(col_tokens))]
+		mtrxs.append(f'{table} $rowid={rowid} ' + SEP_VCTR.join(parts))
+	
+	return str(Meme(SEP_MTRX.join(mtrxs)))
