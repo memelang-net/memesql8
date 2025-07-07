@@ -1,10 +1,15 @@
 '''
-Meme v8.13 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
+Memelang v8.13 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
 This script is optimized for training LLMs
 
 1. MEMELANG USES AXES, LIMIT_AXIS HIGH -> LOW
-SQL ANALOG:  3->Table_Name  2->Row_Primary_Key  1->Column_Name     0->Value
-RDF ANALOG:  3->Graph_Name  2->Subject_URI      1->Predicate_Name  0->Object_Value
+| AXIS | SQL ANALOG  | RDF ANALOG  |
+| ---: | ----------- | ----------- |
+|    3 | Table       | Graph       |
+|    2 | Primary Key | Subject     |
+|    1 | Column      | Predicate   |
+|    0 | Value       | Object      |
+
 
 2. EXAMPLE QUERY
 MEMELANG: movies * actor "Mark Hamill",Mark ; movie * ; rating >4 ;;
@@ -40,32 +45,27 @@ TOKEN_KIND_PATTERNS = (
 	('QUOTE',		r'"(?:[^"\\]|\\.)*"'),	# ALWAYS JSON QUOTE ESCAPE EXOTIC CHARS name="John \"Jack\" Kennedy"
 	('META',		r"'[^']*'"),
 	('IGNORE',		r'-*\|'),
-
 	('SEP_MTRX',	re.escape(SEP_MTRX)),	# MTRX DISJUNCTION, AXIS=0
 	('SEP_VCTR',	re.escape(SEP_VCTR)),	# VCTR CONJUNCTION, AXIS=0
 	('SEP_LIMIT',	r'\s+'),				# LIMIT CONJUNCTION, AXIS+=1
 	('SEP_DATA',	re.escape(SEP_DATA)),	# DATUM DISJUNCTION, AXIS SAME
-	
 	('GE',			r'>='),
 	('LE',			r'<='),
 	('EQL',			r'='),
 	('NOT',			r'!'),
 	('GT',			r'>'),
 	('LT',			r'<'),
-
 	('WILD',		re.escape(WILD)),		# WILDCARD, MATCHES WHOLE VALUE, NEVER QUOTE
 	('MSAME',		re.escape(MSAME)),		# REFERENCES (MTRX_AXIS-1, VCTR_AXIS=-1, LIMIT_AXIS)
 	('VSAME',		re.escape(VSAME)),		# REFERENCES (MTRX_AXIS,   VCTR_AXIS-1,  LIMIT_AXIS)
 	('VDIFF',		re.escape(VDIFF)),		# ANTI-REFERENCES (MTRX_AXIS, VCTR_AXIS-1, LIMIT_AXIS)
 	('EMPTY',		re.escape(EMPTY)),		# EMPTY SET, ANTI-WILD
 	('VAR',			rf'\$[A-Za-z0-9]+'),
-	
 	('IDENT',		r'[A-Za-z][A-Za-z0-9]*'), # ALPHANUMERIC IDENTIFIERS ARE UNQUOTED
 	('FLOAT',		r'-?\d*\.\d+'),
 	('INT',			r'-?\d+'),
 	('MISMATCH',	r'.'),
 )
-
 
 MASTER_PATTERN = re.compile('|'.join(f'(?P<{kind}>{pat})' for kind, pat in TOKEN_KIND_PATTERNS))
 
@@ -108,8 +108,8 @@ TOK_SEP_MTRX = Token('SEP_MTRX', SEP_MTRX)
 class Stream:
 	def __init__(self, token: Iterable[Token]):
 		self.token: Iterator[Token] = iter(token)
-		self.buffer: list[Token] = []
-	def peek(self, fwd: int = 1) -> str|None: 
+		self.buffer: List[Token] = []
+	def peek(self, fwd: int = 1) -> Union[str, None]:
 		while(len(self.buffer)<fwd):
 			val = next(self.token, EOF)
 			if val is EOF: return EOF
@@ -125,23 +125,23 @@ class Stream:
 
 class Olist(list):
 	opr: Token = TOK_EQL
-	def __init__(self, *items: List[Olist|Token], opr:Token|None = None):
+	def __init__(self, *items: Union['Olist', Token], opr:Token|None = None):
 		super().__init__(items)
 		if opr is not None: self.opr = opr
 
 	def prepend(self, item):
 		self.insert(0, item)
 
-	def pad(self, padding:Olist|Token) -> None:
+	def pad(self, padding:Union['Olist', Token]) -> None:
 		max_len = len(self[0])
 		for idx, item in enumerate(self):
 			diff = max_len - len(item)
 			if diff>0: self[idx][:0] = [padding] * diff
-			elif diff<0: raise SyntaxError('E_PAD') # FIRST VCTR MUST BE LONGEST
+			elif diff<0: raise SyntaxError('E_PAD') # FIRST MUST BE LONGEST
 
 	@property
 	def unitary(self) -> bool: return self.opr.unitary and all(item.unitary for item in self)
-	def dump(self) -> list: return [self.opr.dump(), [item.dump() for item in self]]
+	def dump(self) -> List: return [self.opr.dump(), [item.dump() for item in self]]
 	def check(self) -> 'Olist': 
 		if len(self)==0: raise SyntaxError('E_NO_LIST')
 		return self
@@ -210,8 +210,8 @@ def parse(src: str) -> Iterator[Matrix]:
 			# LOGIC CHECKS
 			if any(t.kind == 'VAR' and t.lexeme not in bound_vars for t in data): raise SyntaxError('E_VAR_UNDEF')
 			if len(mtrx)==0 and any(t.kind == 'VSAME' for t in data): raise SyntaxError('E_VSAME_OOB')
-			if len(data)>1 and any(data.kind in SUGAR_KINDS): raise SyntaxError('E_DATA_KIND')
-			if len(data)>1 limit.opr.kind not in OPR_DATA_KINDS: raise SyntaxError('E_DATA_OPR')
+			if len(data)>1 and any(t.kind in SUGAR_KINDS for t in data): raise SyntaxError('E_DATA_KIND')
+			if len(data)>1 and limit.opr.kind not in OPR_DATA_KINDS: raise SyntaxError('E_DATA_OPR')
 
 			# FINALIZE LIMIT
 			limit.append(var)
@@ -257,7 +257,7 @@ class Meme(Olist):
 	def __init__(self, src: str):
 		self.src = src
 		self.bindings = {}
-		super().__init__(parse(src))
+		super().__init__(*parse(src))
 
 	def store(self): 
 		for mtrx_axis, mtrx in enumerate(self):
@@ -344,14 +344,14 @@ def rand_datum(kind:str, i:int=1) -> str:
 Table, Column, SqlOperator, Value = str, str, str, Any
 def demo_translate(table: Table, covs:List[Tuple[Column, SqlOperator, Value]]) -> Tuple[str, str]:
 	if not covs: raise ValueError('covs')
-	if any(isinstance(val,(list,tuple)) and opr.lower() not in ('in','not in') for _,opr,val in covs): raise SyntaxError('data')
+	if any(isinstance(val,(List,Tuple)) and opr.lower() not in ('in','not in') for _,opr,val in covs): raise SyntaxError('data')
 
 	def sql_opr(opr: SqlOperator) -> SqlOperator:
 		if opr.lower() not in {'=','!=','>','>=','<','<=','in','not in'}: raise SyntaxError('opr')
 		return opr
 
 	def sql_val(val: Value) -> Value:
-		if isinstance(val, (list, tuple)): return '(' + ','.join(sql_val(v) for v in val) + ')'
+		if isinstance(val, (List, Tuple)): return '(' + ','.join(sql_val(v) for v in val) + ')'
 		return "'"+str(val).replace("'","''")+"'"
 
 	def memelang_opr(opr:SqlOperator) -> SqlOperator:
@@ -360,7 +360,7 @@ def demo_translate(table: Table, covs:List[Tuple[Column, SqlOperator, Value]]) -
 		return opr
 	
 	def memelang_val(val: Value) -> Value:
-		if isinstance(val, (list, tuple)): return ','.join(memelang_val(v) for v in val)
+		if isinstance(val, (List, Tuple)): return ','.join(memelang_val(v) for v in val)
 		if isinstance(val, str) and re.fullmatch(r'[A-Za-z0-9]+', val): return val
 		return json.dumps(val)
 
