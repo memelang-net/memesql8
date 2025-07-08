@@ -31,6 +31,7 @@ import random, re, json, operator
 from typing import List, Iterator, Iterable, Dict, Tuple, Any, Union
 
 Axis, Memelang, SQL = int, str, str
+TBL, ROW, COL, VAL = Axis(3), Axis(2), Axis(1), Axis(0)
 
 SIGIL, WILD, MSAME, VSAME, VDIFF, EMPTY, EOF =  '$', '*', '^', '@', '~', '_', None
 SEP_LIMIT, SEP_DATA, SEP_VCTR, SEP_MTRX = ' ', ',', ';', ';;'
@@ -149,6 +150,23 @@ class Data(Olist):
 class Limit(Olist):
 	opr: Token = TOK_EQL # ELIDED '='
 
+	def check(self) -> Limit:
+		if len(self)!=2: raise SyntaxError('E_NO_LIST')
+		if self[1][0].kind == 'VDIFF':
+			if self.opr.kind != 'EQL': raise SyntaxError('E_OPR_VDIFF')
+			self.opr=TOK_NOT
+			self[1]=DATA_VSAME
+		if self[1][0].kind == 'WILD':
+			if self.opr.kind == 'EQL': self.opr=TOK_NOT
+			elif self.opr.kind == 'NOT': self.opr=TOK_EQL
+			else: self.opr = TOK_GT # WILD MATCHES ANY NUMERIC
+			self[1]=DATA_EMPTY
+		return self
+
+	@property
+	def wild(self) -> bool: return self.opr.kind in {'NOT','GT'} and self[1][0].kind == 'EMPTY'
+
+
 class Vector(Olist):
 	opr: Token = TOK_SEP_LIMIT
 
@@ -245,6 +263,28 @@ def parse(src: Memelang) -> Iterator[Matrix]:
 	if mtrx: yield mtrx.check()
 
 
+class SQLUtil():
+	@staticmethod
+	def escape(token: Token, bindings: dict) -> SQL:
+		if token.kind == 'VSAME':
+			if VSAME not in bindings: raise SyntaxError('E_SAME_PREV')
+			return bindings[VSAME]
+		elif token.kind == 'VAR':
+			if token.lexeme not in bindings: raise SyntaxError('E_VAR_BIND')
+			return bindings[token.lexeme]
+		return "'" + str(token.datum).replace("'", "''") + "'" if isinstance(token.datum, str) else str(token.datum)
+
+	@staticmethod
+	def compare(alias_col: str, limit: Limit, bindings: dict) -> SQL:
+		if len(limit[1]) > 1:
+			if limit.opr.kind == 'EQL': sym = 'IN'
+			elif limit.opr.kind == 'NOT': sym = 'NOT IN'
+			else: raise SyntaxError()
+			return f'{alias_col} {sym} ('+ ', '.join(SQLUtil.escape(v, bindings) for v in limit[1]) + ')'
+		sym = {'EQL':'=','NOT':'!=','GT':'>','GE':'>=','LT':'<','LE':'<='}[limit.opr.kind]
+		return f'{alias_col} {sym} {SQLUtil.escape(limit[1][0], bindings)}'
+
+
 class Meme(Olist):
 	opr: Token = TOK_SEP_MTRX
 	results: List[List[List[Data]]]
@@ -297,31 +337,66 @@ class Meme(Olist):
 		if len(expansion)>1: expansion.opr = TOK_SEP_DATA
 		return expansion.check()
 
-	def to_table(self, primary_col:str = 'id'):
-		for mtrx_axis in range(len(self)): self[mtrx_axis].pad(LIMIT_EQL_VSAME)
-		return ' UNION '.join(translate_matrix_table(mtrx, primary_col) for mtrx in self)
 
+	def to_table(self, primary_col:str = 'id') -> SQL:
+		alias_idx: int = 0
+		statements = []
+		
+		for mtrx in self:
+			mtrx.pad(LIMIT_EQL_VSAME)
+			froms, wheres, selects = [], [], []
+			sqlbind = {}
+			prev_table, prev_alias, prev_row, prev_col = None, None, None, None
 
-def desugar(limit: Limit) -> Limit:
-	if limit[1][0].kind == 'VDIFF':
-		if limit.opr.kind != 'EQL': raise SyntaxError('E_OPR_VDIFF')
-		return Limit(limit[0], DATA_VSAME, opr=TOK_NOT)
-	if limit[1][0].kind == 'WILD':
-		if limit.opr.kind == 'EQL': opr=TOK_NOT
-		elif limit.opr.kind == 'NOT': opr=TOK_EQL
-		else: opr = TOK_GT # WILD MATCHES ANY NUMERIC
-		return Limit(limit[0], DATA_EMPTY, opr=opr)
-	return limit
+			for vctr in mtrx:
+				curr_alias, curr_row = prev_alias, prev_row
+				same_row = vctr[ROW].wild or  (vctr[ROW].opr.kind == 'EQL' and (vctr[ROW][1][0].kind == 'VSAME' or (vctr[ROW][1][0].kind in {'INT', 'FLOAT', 'ALNUM'} and vctr[ROW][1][0].datum == prev_row)))
 
+				# TABLE
+				if vctr[TBL].opr.kind != 'EQL': raise SyntaxError('E_SQL_SUPPORT_TO')
+				elif vctr[TBL][1][0].kind == 'VSAME': curr_table = prev_table
+				elif vctr[TBL][1][0].kind in {'ALNUM', 'QUOTE'}: curr_table = vctr[TBL][1][0].datum 
+				else: raise SyntaxError('E_SQL_SUPPORT_TV')
 
-def iswild(limit: Limit) -> bool:
-	return limit.opr.kind in {'NOT','GT'} and limit[1][0].kind == 'EMPTY'
+				# TABLE ALIAS
+				if prev_table != curr_table or not same_row:
+					curr_alias = f't{alias_idx}'
+					froms.append(f'{curr_table} AS {curr_alias}')
+					prev_table = curr_table
+					alias_idx += 1
+
+				# COLUMN
+				if vctr[COL].opr.kind != 'EQL': raise SyntaxError('E_SQL_SUPPORT_CO')
+				elif vctr[COL][1][0].kind == 'VSAME': curr_col = prev_col
+				elif vctr[COL][1][0].kind in {'ALNUM', 'QUOTE'}: curr_col = vctr[COL][1][0].datum
+				else: raise SyntaxError('E_SQL_SUPPORT_CV')
+
+				# PRIMARY KEY
+				if not same_row:
+					if prev_alias: sqlbind[VSAME]=f'{prev_alias}.{primary_col}'
+					wheres.append(SQLUtil.compare(f'{curr_alias}.{primary_col}', vctr[ROW], sqlbind))
+					if vctr[ROW].opr.kind=='EQL' and vctr[ROW][1][0].kind in {'INT', 'FLOAT', 'ALNUM'}: curr_row = vctr[ROW][1][0].datum
+					else: curr_row = None
+
+				# VALUE
+				if prev_alias: sqlbind[VSAME]=f'{prev_alias}.{prev_col}'
+				if not vctr[VAL].wild: wheres.append(SQLUtil.compare(f'{curr_alias}.{curr_col}', vctr[VAL], sqlbind))
+
+				# BIND VARS
+				if vctr[ROW][0].kind == 'VAR': sqlbind[vctr[ROW][0].lexeme]=f'{curr_alias}.{primary_col}'
+				if vctr[VAL][0].kind == 'VAR': sqlbind[vctr[VAL][0].lexeme]=f'{curr_alias}.{curr_col}'
+
+				selects.append(f'{curr_alias}.{curr_col}')
+				prev_alias, prev_row, prev_col = curr_alias, curr_row, curr_col
+
+			statements.append('SELECT '+ ', '.join(list(dict.fromkeys(selects))) + ' FROM ' + ', '.join(froms) + ' WHERE ' + ' AND '.join(wheres))
+
+		return ' UNION '.join(statements)
 
 
 def intersect(query: Limit, store: Data) -> Data:
 	if not store: store=DATA_EMPTY
 
-	query = desugar(query)
 	opr_kind, intersection, query_data = query.opr.kind, Data(), [t.datum for t in query[1]]
 
 	if opr_kind == 'EQL': intersection.extend([t for t in store if t.datum in query_data])
@@ -336,174 +411,98 @@ def intersect(query: Limit, store: Data) -> Data:
 	return intersection
 
 
-# BELOW ARE DEMO FUNCTIONS FOR LLM TRAINING
-comma = ', '
-TBL, ROW, COL, VAL = Axis(3), Axis(2), Axis(1), Axis(0)
+# GENERATE RANDOM MEMELANG DATA
+class Fuzz():
+	@staticmethod
+	def datum(kind:str, i:int=1) -> Memelang:
+		if kind=='ALNUM': return ''.join(random.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(i))
+		if kind=='QUOTE': return json.dumps(''.join(random.choice(' -_+,./<>[]{}\'"!@#$%^&*()abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(i)))
+		if kind=='INT': return str(random.randint(-i, i))
+		if kind=='FLOAT': return str(random.uniform(-i, i))
+		if kind=='VAR': return SIGIL + Fuzz.datum('ALNUM', i)
 
-def fuzz_datum(kind:str, i:int=1) -> Memelang:
-	if kind=='ALNUM': return ''.join(random.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(i))
-	if kind=='QUOTE': return json.dumps(''.join(random.choice(' -_+,./<>[]{}\'"!@#$%^&*()abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(i)))
-	if kind=='INT': return str(random.randint(-i, i))
-	if kind=='FLOAT': return str(random.uniform(-i, i))
-	if kind=='VAR': return SIGIL + fuzz_datum('ALNUM', i)
+	@staticmethod
+	def limit(bindings: List[str] = []) -> Memelang:
+		var = ''
+		do_assign_variable = random.randint(0, 1)
+		if do_assign_variable: var += Fuzz.datum('VAR',3)
 
+		opr = random.choice(['=','!','>','<','<=','>='])
 
-def fuzz_limit(bindings: List[str] = []) -> Memelang:
-	var = ''
-	do_assign_variable = random.randint(0, 1)
-	if do_assign_variable: var += fuzz_datum('VAR',3)
+		data: str = ''
+		if opr in {'=','!'}:
+			data_list_len = random.randint(1, 5)
+			data_list: List[Any] = []
+			for _ in range(data_list_len):
+				datum_type = random.randint(1, 10)
+				if datum_type == 1:  data_list.append(Fuzz.datum('QUOTE',10))
+				elif datum_type == 2:  data_list.append(Fuzz.datum('INT', 100))
+				elif datum_type == 3:  data_list.append(Fuzz.datum('FLOAT', 100))
+				elif datum_type == 4 and bindings: data_list.append(random.choice(bindings))
+				elif datum_type == 5 and VSAME in bindings: data_list.append(VSAME)
+				elif datum_type == 6 and VSAME in bindings and opr == '=' and data_list_len == 1: data_list.append(VDIFF)
+				else: data_list.append(Fuzz.datum('ALNUM', 5))
+			data += SEP_DATA.join(data_list)
+		else:
+			data = Fuzz.datum('FLOAT', 100)
 
-	opr = random.choice(['=','!','>','<','<=','>='])
+		if var:
+			assert opr
+			bindings.append(var)
 
-	data: str = ''
-	if opr in {'=','!'}:
-		data_list_len = random.randint(1, 5)
-		data_list: List[Any] = []
-		for _ in range(data_list_len):
-			datum_type = random.randint(1, 10)
-			if datum_type == 1:  data_list.append(fuzz_datum('QUOTE',10))
-			elif datum_type == 2:  data_list.append(fuzz_datum('INT', 100))
-			elif datum_type == 3:  data_list.append(fuzz_datum('FLOAT', 100))
-			elif datum_type == 4 and bindings: data_list.append(random.choice(bindings))
-			elif datum_type == 5 and VSAME in bindings: data_list.append(VSAME)
-			elif datum_type == 6 and VSAME in bindings and opr == '=' and data_list_len == 1: data_list.append(VDIFF)
-			else: data_list.append(fuzz_datum('ALNUM', 5))
-		data += SEP_DATA.join(data_list)
-	else:
-		data = fuzz_datum('FLOAT', 100)
+		return var + opr + data
 
-	if var:
-		assert opr
-		bindings.append(var)
+	@staticmethod
+	def vector(limit_len:int = 4) -> Memelang:
+		bindings, vector = [], []
+		for i in range(limit_len):
+			if i>0: bindings.append(VSAME)
+			vector.append(Fuzz.limit(bindings))
+		return SEP_LIMIT.join(vector) + SEP_VCTR_PRETTY
 
-	return var + opr + data
-
-
-def fuzz_vector(limit_len:int = 4) -> Memelang:
-	bindings, vector = [], []
-	for i in range(limit_len):
-		if i>0: bindings.append(VSAME)
-		vector.append(fuzz_limit(bindings))
-	return SEP_LIMIT.join(vector) + SEP_VCTR_PRETTY
-
-
-def fuzz_mtrx_table(col_len:int = 5) -> Memelang:
-	return fuzz_datum('ALNUM',5) + SEP_LIMIT + WILD + SEP_LIMIT + SEP_VCTR_PRETTY.join(fuzz_datum('ALNUM',5) + fuzz_limit() for _ in range(col_len)) + SEP_MTRX_PRETTY
-
-
-def translate_table_output(sql_output: str) -> Memelang:
-	lines=[l for l in sql_output.splitlines() if l.startswith('|')]
-	if not lines:return ''
-	header=[c.strip() for c in lines[0].strip('|').split('|')]
-	mtrxs=[]
-	for line in lines[1:]:
-		cells=[c.strip() for c in line.strip('|').split('|')]
-		if len(cells)!=len(header):continue
-		id_val=cells[0]
-		parts=[f'{header[i]} {cells[i]}' for i in range(1,len(header))]
-		mtrxs.append(f'$rowid={id_val} ' + SEP_VCTR_PRETTY.join(parts))
-	return SEP_MTRX_PRETTY.join(mtrxs)
+	@staticmethod
+	def mtrx_table(col_len:int = 5) -> Memelang:
+		return Fuzz.datum('ALNUM',5) + SEP_LIMIT + WILD + SEP_LIMIT + SEP_VCTR_PRETTY.join(Fuzz.datum('ALNUM',5) + Fuzz.limit() for _ in range(col_len)) + SEP_MTRX_PRETTY
 
 
-def translate_table_insert(sql_insert: SQL) -> Memelang:
-	m = re.search(r'INSERT\s+INTO\s+(\w+)\s*\((.*?)\)\s*VALUES\s*(.*);', sql_insert, re.I | re.S)
-	if not m: return ''
-	table = m.group(1)
-	header = [h.strip() for h in m.group(2).split(',')]
-	rows_sql = re.findall(r'\(([^()]*)\)', m.group(3))
-	mtrxs = []
-	for idx, row in enumerate(rows_sql):
-		cells = [c.strip(" '\"") for c in re.findall(r"'[^']*'|[^,]+", row)]
-		if len(cells) != len(header): continue
-		rowid = cells[0]
-		col_tokens = header[1:] if idx == 0 else [MSAME] * (len(header) - 1)
-		parts = [f'{col_tokens[i]} {cells[i + 1]}' for i in range(len(col_tokens))]
-		mtrxs.append(f'{table} $rowid={rowid} ' + SEP_VCTR_PRETTY.join(parts))
-	return SEP_MTRX_PRETTY.join(mtrxs)
+# TRANSLATE SQL TO MEMELANG
+class SQL2Memelang():
+	@staticmethod
+	def output(sql_output: str) -> Memelang:
+		lines=[l for l in sql_output.splitlines() if l.startswith('|')]
+		if not lines:return ''
+		header=[c.strip() for c in lines[0].strip('|').split('|')]
+		mtrxs=[]
+		for line in lines[1:]:
+			cells=[c.strip() for c in line.strip('|').split('|')]
+			if len(cells)!=len(header):continue
+			id_val=cells[0]
+			parts=[f'{header[i]} {cells[i]}' for i in range(1,len(header))]
+			mtrxs.append(f'$rowid={id_val} ' + SEP_VCTR_PRETTY.join(parts))
+		return SEP_MTRX_PRETTY.join(mtrxs)
+
+	@staticmethod
+	def insert(sql_insert: SQL) -> Memelang:
+		m = re.search(r'INSERT\s+INTO\s+(\w+)\s*\((.*?)\)\s*VALUES\s*(.*);', sql_insert, re.I | re.S)
+		if not m: return ''
+		table = m.group(1)
+		header = [h.strip() for h in m.group(2).split(',')]
+		rows_sql = re.findall(r'\(([^()]*)\)', m.group(3))
+		mtrxs = []
+		for idx, row in enumerate(rows_sql):
+			cells = [c.strip(" '\"") for c in re.findall(r"'[^']*'|[^,]+", row)]
+			if len(cells) != len(header): continue
+			rowid = cells[0]
+			col_tokens = header[1:] if idx == 0 else [MSAME] * (len(header) - 1)
+			parts = [f'{col_tokens[i]} {cells[i + 1]}' for i in range(len(col_tokens))]
+			mtrxs.append(f'{table} $rowid={rowid} ' + SEP_VCTR_PRETTY.join(parts))
+		return SEP_MTRX_PRETTY.join(mtrxs)
 
 
-def sql_escape(token: Token, bindings: dict) -> SQL:
-	if token.kind == 'VSAME':
-		if VSAME not in bindings: raise SyntaxError('E_SAME_PREV')
-		return bindings[VSAME]
-	elif token.kind == 'VAR':
-		if token.lexeme not in bindings: raise SyntaxError('E_VAR_BIND')
-		return bindings[token.lexeme]
-	return "'" + str(token.datum).replace("'", "''") + "'" if isinstance(token.datum, str) else str(token.datum)
-
-
-def sql_compare(alias_col: str, limit: Limit, bindings: dict) -> SQL:
-	if len(limit[1]) > 1:
-		if limit.opr.kind == 'EQL': sym = 'IN'
-		elif limit.opr.kind == 'NOT': sym = 'NOT IN'
-		else: raise SyntaxError()
-		return f'{alias_col} {sym} ({comma.join(sql_escape(v, bindings) for v in limit[1])})'
-	sym = {'EQL':'=','NOT':'!=','GT':'>','GE':'>=','LT':'<','LE':'<='}[limit.opr.kind]
-	return f'{alias_col} {sym} {sql_escape(limit[1][0], bindings)}'
-
-
-alias_idx: int = 0
-def translate_matrix_table(mtrx: Matrix, primary_col: str = 'id') -> SQL:
-	global alias_idx
-	bindings = {}
-	froms, wheres, selects = [], [], []
-	prev_table, prev_alias, prev_row, prev_col = None, None, None, None
-
-	for vctr in mtrx:
-		curr = [None, None, None, None]
-		for i in (VAL, ROW, COL, TBL):
-			if not vctr[i]: raise ValueError()
-			curr[i]=desugar(vctr[i])
-			if curr[i][1][0].kind == 'VSAME':
-				if not prev_alias: raise SyntaxError(f'E_FIRST_{i}')
-
-		curr_alias, curr_row = prev_alias, prev_row
-		same_row = iswild(curr[ROW]) or  (curr[ROW].opr.kind == 'EQL' and (curr[ROW][1][0].kind == 'VSAME' or (curr[ROW][1][0].kind in {'INT', 'FLOAT', 'ALNUM'} and curr[ROW][1][0].datum == prev_row)))
-
-		# TABLE
-		if curr[TBL].opr.kind != 'EQL': raise SyntaxError('E_SQL_SUPPORT_TO')
-		elif curr[TBL][1][0].kind == 'VSAME': curr_table = prev_table
-		elif curr[TBL][1][0].kind in {'ALNUM', 'QUOTE'}: curr_table = curr[TBL][1][0].datum 
-		else: raise SyntaxError('E_SQL_SUPPORT_TV')
-
-		# TABLE ALIAS
-		if prev_table != curr_table or not same_row:
-			curr_alias = f't{alias_idx}'
-			froms.append(f'{curr_table} AS {curr_alias}')
-			prev_table = curr_table
-			alias_idx += 1
-
-		# COLUMN
-		if curr[COL].opr.kind != 'EQL': raise SyntaxError('E_SQL_SUPPORT_CO')
-		elif curr[COL][1][0].kind == 'VSAME': curr_col = prev_col
-		elif curr[COL][1][0].kind in {'ALNUM', 'QUOTE'}: curr_col = curr[COL][1][0].datum
-		else: raise SyntaxError('E_SQL_SUPPORT_CV')
-
-		# PRIMARY KEY
-		if not same_row:
-			if prev_alias: bindings[VSAME]=f'{prev_alias}.{primary_col}'
-			wheres.append(sql_compare(f'{curr_alias}.{primary_col}', curr[ROW], bindings))
-			if curr[ROW].opr.kind=='EQL' and curr[ROW][1][0].kind in {'INT', 'FLOAT', 'ALNUM'}: curr_row = curr[ROW][1][0].datum
-			else: curr_row = None
-
-		# VALUE
-		if prev_alias: bindings[VSAME]=f'{prev_alias}.{prev_col}'
-		if not iswild(curr[VAL]): wheres.append(sql_compare(f'{curr_alias}.{curr_col}', curr[VAL], bindings))
-
-		# BIND VARS
-		if curr[ROW][0].kind == 'VAR': bindings[curr[ROW][0].lexeme]=f'{curr_alias}.{primary_col}'
-		if curr[VAL][0].kind == 'VAR': bindings[curr[VAL][0].lexeme]=f'{curr_alias}.{curr_col}'
-
-		selects.append(f'{curr_alias}.{curr_col}')
-		prev_alias, prev_row, prev_col = curr_alias, curr_row, curr_col
-
-	return 'SELECT '+ comma.join(list(dict.fromkeys(selects))) + ' FROM ' + comma.join(froms) + ' WHERE ' + ' AND '.join(wheres)
-
-
-def demo() -> List[Tuple[Memelang, SQL]]:
+if __name__ == '__main__':
 	memelangs: List[Memelang] = [
 		'movies * actor "Mark Hamill",Mark ; movie * ; rating >4 ;;',
 		'movies * actor "Mark Hamill" ; movie * ; ~ @ @ ; actor * ;;',
-		fuzz_mtrx_table()		
+		Fuzz.mtrx_table()		
 	]
-	return [(src, Meme(src).to_table()) for src in memelangs]
+	for src in memelangs: print(src, Meme(src).to_table())
