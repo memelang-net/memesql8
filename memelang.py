@@ -1,6 +1,5 @@
 '''
-Memelang v8.14 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
-This script is optimized for training LLMs
+This script is optimized for training LLMs | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
 
 1. MEMELANG USES AXES, LIMIT_AXIS HIGH -> LOW
 | AXIS | SQL ANALOG  | RDF ANALOG  |
@@ -12,7 +11,7 @@ This script is optimized for training LLMs
 
 2. EXAMPLE QUERY
 MEMELANG: movies * actor "Mark Hamill",Mark ; movie * ; rating >4 ;;
-SQL: SELECT rowid, actor, movie, rating FROM movies WHERE rowid=* AND actor IN ("Mark Hamill", "Mark") AND movie=* AND rating>4
+SQL: SELECT t0.actor, t0.movie, t0.rating FROM movies AS t0 WHERE t0.actor IN ('Mark Hamill', 'Mark') AND t0.rating > 4
 RDF: SELECT … WHERE { GRAPH <movies> {?s actor ?o . FILTER(?o IN ("Mark Hamill","Mark")) . ?s movie ?x . ?s rating ?r . FILTER(?r > 4)} }
 
 3. VARIABLE EXAMPLE ACTOR NAME = MOVIE TITLE
@@ -22,18 +21,16 @@ SQL: SELECT rowid, actor, movie FROM movies WHERE actor=movie
 4. EXAMPLE JOIN QUERY
 MEMELANG: movies * actor "Mark Hamill" ; movie * ; ~ @ @ ; actor * ;;
 MEMELANG: movies $rowid=* actor "Mark Hamill" ; movie * ; !$rowid @ @ ; actor !"Mark Hamill" ;;
-SQL: SELECT co.rowid, co.movie, co.actor FROM movies AS mh JOIN movies AS co ON co.movie=mh.movie AND co.rowid!=mh.rowid WHERE mh.actor='Mark Hamill';
+SQL: SELECT t0.actor, t0.movie, t1.movie, t1.actor FROM movies AS t0, movies AS t1 WHERE t0.actor = 'Mark Hamill' AND t1.rowid != t0.rowid AND t1.movie = t0.movie
 RDF: SELECT ?coActor WHERE { GRAPH <movies> { ?mhRow ex:actor "Mark Hamill" ; ex:movie ?movie . ?coRow ex:movie ?movie ; ex:actor ?coActor . FILTER ( ?coRow != ?mhRow ) } }
 '''
+
+MEMELANG_VER = 8.15
 
 import random, re, json, operator
 from typing import List, Iterator, Iterable, Dict, Tuple, Any, Union
 
-RAND_INT_MIN = 1 << 20
-RAND_INT_MAX = 1 << 53
-
 Axis, Memelang, SQL = int, str, str
-TBL, ROW, COL, VAL = Axis(3), Axis(2), Axis(1), Axis(0)
 
 SIGIL, WILD, MSAME, VSAME, VDIFF, EMPTY, EOF =  '$', '*', '^', '@', '~', '_', None
 SEP_LIMIT, SEP_DATA, SEP_VCTR, SEP_MTRX = ' ', ',', ';', ';;'
@@ -50,8 +47,8 @@ TOKEN_KIND_PATTERNS = (
 	('SEP_DATA',	re.escape(SEP_DATA)),	# DATUM DISJUNCTION, AXIS SAME
 	('GE',			r'>='),
 	('LE',			r'<='),
+	('NOT',			r'!=?'),
 	('EQL',			r'='),
-	('NOT',			r'!'),
 	('GT',			r'>'),
 	('LT',			r'<'),
 	('WILD',		re.escape(WILD)),		# WILDCARD, MATCHES WHOLE VALUE, NEVER QUOTE
@@ -135,7 +132,7 @@ class Olist(list):
 		max_len = len(self[0])
 		for idx, item in enumerate(self):
 			diff = max_len - len(item)
-			if diff>0: self[idx][:0] = [padding] * diff
+			if diff>0: self[idx] += [padding] * diff
 			elif diff<0: raise SyntaxError('E_PAD') # FIRST MUST BE LONGEST
 
 	@property
@@ -283,7 +280,6 @@ class Meme(Olist):
 
 		return self
 
-
 	def expand(self, data: Data, from_limit_axis: Axis, from_vctr_axis: Axis, from_mtrx_axis: Axis) -> Data:
 		expansion=Data()
 		for tok in data:
@@ -301,6 +297,10 @@ class Meme(Olist):
 		if len(expansion)>1: expansion.opr = TOK_SEP_DATA
 		return expansion.check()
 
+	def to_table(self, primary_col:str = 'id'):
+		for mtrx_axis in range(len(self)): self[mtrx_axis].pad(LIMIT_EQL_VSAME)
+		return ' UNION '.join(translate_matrix_table(mtrx, primary_col) for mtrx in self)
+
 
 def desugar(limit: Limit) -> Limit:
 	if limit[1][0].kind == 'VDIFF':
@@ -312,6 +312,10 @@ def desugar(limit: Limit) -> Limit:
 		else: opr = TOK_GT # WILD MATCHES ANY NUMERIC
 		return Limit(limit[0], DATA_EMPTY, opr=opr)
 	return limit
+
+
+def iswild(limit: Limit) -> bool:
+	return limit.opr.kind in {'NOT','GT'} and limit[1][0].kind == 'EMPTY'
 
 
 def intersect(query: Limit, store: Data) -> Data:
@@ -333,52 +337,58 @@ def intersect(query: Limit, store: Data) -> Data:
 
 
 # BELOW ARE DEMO FUNCTIONS FOR LLM TRAINING
+comma = ', '
+TBL, ROW, COL, VAL = Axis(3), Axis(2), Axis(1), Axis(0)
 
-def rand_datum(kind:str, i:int=1) -> Memelang:
+def fuzz_datum(kind:str, i:int=1) -> Memelang:
 	if kind=='ALNUM': return ''.join(random.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(i))
 	if kind=='QUOTE': return json.dumps(''.join(random.choice(' -_+,./<>[]{}\'"!@#$%^&*()abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(i)))
 	if kind=='INT': return str(random.randint(-i, i))
 	if kind=='FLOAT': return str(random.uniform(-i, i))
-	if kind=='VAR': return SIGIL + rand_datum('ALNUM', i)
+	if kind=='VAR': return SIGIL + fuzz_datum('ALNUM', i)
 
 
-def demo_generate() -> Memelang:
-	bound_vars, vector = [], []
+def fuzz_limit(bindings: List[str] = []) -> Memelang:
+	var = ''
+	do_assign_variable = random.randint(0, 1)
+	if do_assign_variable: var += fuzz_datum('VAR',3)
 
-	limit_len = random.randint(2, 10)
-	for _ in range(limit_len):
-		var = ''
-		do_assign_variable = random.randint(0, 1)
-		if do_assign_variable: var += rand_datum('VAR',3)
+	opr = random.choice(['=','!','>','<','<=','>='])
 
-		opr = random.choice(['=','!','>','<','<=','>='])
+	data: str = ''
+	if opr in {'=','!'}:
+		data_list_len = random.randint(1, 5)
+		data_list: List[Any] = []
+		for _ in range(data_list_len):
+			datum_type = random.randint(1, 10)
+			if datum_type == 1:  data_list.append(fuzz_datum('QUOTE',10))
+			elif datum_type == 2:  data_list.append(fuzz_datum('INT', 100))
+			elif datum_type == 3:  data_list.append(fuzz_datum('FLOAT', 100))
+			elif datum_type == 4 and bindings: data_list.append(random.choice(bindings))
+			elif datum_type == 5 and VSAME in bindings: data_list.append(VSAME)
+			elif datum_type == 6 and VSAME in bindings and opr == '=' and data_list_len == 1: data_list.append(VDIFF)
+			else: data_list.append(fuzz_datum('ALNUM', 5))
+		data += SEP_DATA.join(data_list)
+	else:
+		data = fuzz_datum('FLOAT', 100)
 
-		data = ''
-		if opr in {'=','!'}:
-			data_list_len = random.randint(1, 5)
-			data_list: List[Any] = []
-			for _ in range(data_list_len):
-				datum_type = random.randint(1, 10)
-				if datum_type == 1:  data_list.append(rand_datum('QUOTE',10))
-				elif datum_type == 2:  data_list.append(rand_datum('INT', 100))
-				elif datum_type == 3:  data_list.append(rand_datum('FLOAT', 100))
-				elif datum_type == 4 and bound_vars: data_list.append(random.choice(bound_vars))
-				elif datum_type == 5 and vector: data_list.append(VSAME)
-				elif datum_type == 6 and vector and opr == '=' and data_list_len == 1: data_list.append(VDIFF)
-				else: data_list.append(rand_datum('ALNUM', 5))
-			data += SEP_DATA.join(data_list)
+	if var:
+		assert opr
+		bindings.append(var)
 
-		else:
-			data = str(random.uniform(-100, 100))
+	return var + opr + data
 
-		if var:
-			assert opr
-			bound_vars.append(var)
-		elif not var and opr == '=': opr = '' # ELIDED '='
 
-		vector.append(var + opr + data)
+def fuzz_vector(limit_len:int = 4) -> Memelang:
+	bindings, vector = [], []
+	for i in range(limit_len):
+		if i>0: bindings.append(VSAME)
+		vector.append(fuzz_limit(bindings))
+	return SEP_LIMIT.join(vector) + SEP_VCTR_PRETTY
 
-	return SEP_VCTR.join(vector) + SEP_MTRX
+
+def fuzz_mtrx_table(col_len:int = 5) -> Memelang:
+	return fuzz_datum('ALNUM',5) + SEP_LIMIT + WILD + SEP_LIMIT + SEP_VCTR_PRETTY.join(fuzz_datum('ALNUM',5) + fuzz_limit() for _ in range(col_len)) + SEP_MTRX_PRETTY
 
 
 def translate_table_output(sql_output: str) -> Memelang:
@@ -412,26 +422,32 @@ def translate_table_insert(sql_insert: SQL) -> Memelang:
 	return SEP_MTRX_PRETTY.join(mtrxs)
 
 
-def sql_escape(token: Token, prev_alias: str, prev_col: str) -> SQL:
+def sql_escape(token: Token, bindings: dict) -> SQL:
 	if token.kind == 'VSAME':
-		if not prev_alias or not prev_col: raise SyntaxError('E_SAME_PREV')
-		return f'{prev_alias}.{prev_col}'
+		if VSAME not in bindings: raise SyntaxError('E_SAME_PREV')
+		return bindings[VSAME]
+	elif token.kind == 'VAR':
+		if token.lexeme not in bindings: raise SyntaxError('E_VAR_BIND')
+		return bindings[token.lexeme]
 	return "'" + str(token.datum).replace("'", "''") + "'" if isinstance(token.datum, str) else str(token.datum)
 
-def sql_compare(curr_alias: str, curr_col: str, limit: Limit, prev_alias: str, prev_col: str) -> SQL:
+
+def sql_compare(alias_col: str, limit: Limit, bindings: dict) -> SQL:
 	if len(limit[1]) > 1:
 		if limit.opr.kind == 'EQL': sym = 'IN'
 		elif limit.opr.kind == 'NOT': sym = 'NOT IN'
 		else: raise SyntaxError()
-		return f'{curr_alias}.{curr_col} {sym} ({comma.join(sql_escape(v, prev_alias, prev_col) for v in limit[1])})'
+		return f'{alias_col} {sym} ({comma.join(sql_escape(v, bindings) for v in limit[1])})'
 	sym = {'EQL':'=','NOT':'!=','GT':'>','GE':'>=','LT':'<','LE':'<='}[limit.opr.kind]
-	return f'{curr_alias}.{curr_col} {sym} {sql_escape(limit[1][0], prev_alias, prev_col)}'
+	return f'{alias_col} {sym} {sql_escape(limit[1][0], bindings)}'
 
 
+alias_idx: int = 0
 def translate_matrix_table(mtrx: Matrix, primary_col: str = 'id') -> SQL:
-	comma = ', '
+	global alias_idx
+	bindings = {}
 	froms, wheres, selects = [], [], []
-	prev_table, prev_alias, prev_row, prev_col, alias_idx = None, None, None, None, 0
+	prev_table, prev_alias, prev_row, prev_col = None, None, None, None
 
 	for vctr in mtrx:
 		curr = [None, None, None, None]
@@ -441,32 +457,42 @@ def translate_matrix_table(mtrx: Matrix, primary_col: str = 'id') -> SQL:
 			if curr[i][1][0].kind == 'VSAME':
 				if not prev_alias: raise SyntaxError(f'E_FIRST_{i}')
 
-		curr_alias = prev_alias
-		curr_row = prev_row
-		same_row = curr[ROW].opr.kind == 'EQL' and (curr[ROW][1][0].kind == 'VSAME' or (curr[ROW][1][0].kind in {'INT', 'FLOAT', 'ALNUM'} and curr[ROW][1][0].datum == prev_row))
+		curr_alias, curr_row = prev_alias, prev_row
+		same_row = iswild(curr[ROW]) or  (curr[ROW].opr.kind == 'EQL' and (curr[ROW][1][0].kind == 'VSAME' or (curr[ROW][1][0].kind in {'INT', 'FLOAT', 'ALNUM'} and curr[ROW][1][0].datum == prev_row)))
 
 		# TABLE
-		curr_table = prev_table if curr[TBL].opr.kind=='EQL' and curr[TBL][1][0].kind == 'VSAME' else curr[TBL][1][0].lexeme
+		if curr[TBL].opr.kind != 'EQL': raise SyntaxError('E_SQL_SUPPORT_TO')
+		elif curr[TBL][1][0].kind == 'VSAME': curr_table = prev_table
+		elif curr[TBL][1][0].kind in {'ALNUM', 'QUOTE'}: curr_table = curr[TBL][1][0].datum 
+		else: raise SyntaxError('E_SQL_SUPPORT_TV')
+
+		# TABLE ALIAS
 		if prev_table != curr_table or not same_row:
 			curr_alias = f't{alias_idx}'
 			froms.append(f'{curr_table} AS {curr_alias}')
 			prev_table = curr_table
 			alias_idx += 1
 
+		# COLUMN
+		if curr[COL].opr.kind != 'EQL': raise SyntaxError('E_SQL_SUPPORT_CO')
+		elif curr[COL][1][0].kind == 'VSAME': curr_col = prev_col
+		elif curr[COL][1][0].kind in {'ALNUM', 'QUOTE'}: curr_col = curr[COL][1][0].datum
+		else: raise SyntaxError('E_SQL_SUPPORT_CV')
+
 		# PRIMARY KEY
 		if not same_row:
-			wheres.append(sql_compare(curr_alias, primary_col, curr[ROW], prev_alias, primary_col))
+			if prev_alias: bindings[VSAME]=f'{prev_alias}.{primary_col}'
+			wheres.append(sql_compare(f'{curr_alias}.{primary_col}', curr[ROW], bindings))
 			if curr[ROW].opr.kind=='EQL' and curr[ROW][1][0].kind in {'INT', 'FLOAT', 'ALNUM'}: curr_row = curr[ROW][1][0].datum
 			else: curr_row = None
 
-		# COLUMN
-		if curr[COL].opr.kind != 'EQL' or curr[COL][1][0].kind == 'VSAME':
-			if curr[TBL].opr.kind == 'EQL': curr_col = prev_col
-			else: raise SyntaxError('E_UNSUPPORTED')
-		else: curr_col = curr[COL][1][0].lexeme
-
 		# VALUE
-		if curr[VAL][1][0].kind != 'EMPTY': wheres.append(sql_compare(curr_alias, curr_col, curr[VAL], prev_alias, prev_col))
+		if prev_alias: bindings[VSAME]=f'{prev_alias}.{prev_col}'
+		if not iswild(curr[VAL]): wheres.append(sql_compare(f'{curr_alias}.{curr_col}', curr[VAL], bindings))
+
+		# BIND VARS
+		if curr[ROW][0].kind == 'VAR': bindings[curr[ROW][0].lexeme]=f'{curr_alias}.{primary_col}'
+		if curr[VAL][0].kind == 'VAR': bindings[curr[VAL][0].lexeme]=f'{curr_alias}.{curr_col}'
 
 		selects.append(f'{curr_alias}.{curr_col}')
 		prev_alias, prev_row, prev_col = curr_alias, curr_row, curr_col
@@ -474,5 +500,10 @@ def translate_matrix_table(mtrx: Matrix, primary_col: str = 'id') -> SQL:
 	return 'SELECT '+ comma.join(list(dict.fromkeys(selects))) + ' FROM ' + comma.join(froms) + ' WHERE ' + ' AND '.join(wheres)
 
 
-def translate_meme_sql(meme: Meme, primary_col: str = 'id') -> SQL:
-	return ' UNION '.join(translate_matrix_table(mtrx, primary_col) for mtrx in meme)
+def demo() -> List[Tuple[Memelang, SQL]]:
+	memelangs: List[Memelang] = [
+		'movies * actor "Mark Hamill",Mark ; movie * ; rating >4 ;;',
+		'movies * actor "Mark Hamill" ; movie * ; ~ @ @ ; actor * ;;',
+		fuzz_mtrx_table()		
+	]
+	return [(src, Meme(src).to_table()) for src in memelangs]
