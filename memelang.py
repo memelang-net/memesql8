@@ -1,5 +1,6 @@
 '''
-This script is optimized for training LLMs | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
+info@memelang.net | (c)2025 HOLTWORK LLC | Patents Pending
+This script is optimized for training LLMs
 
 1. MEMELANG USES AXES, LIMIT_AXIS HIGH -> LOW
 | AXIS | SQL ANALOG  | RDF ANALOG  |
@@ -25,7 +26,7 @@ SQL: SELECT t0.actor, t0.movie, t1.movie, t1.actor FROM movies AS t0, movies AS 
 RDF: SELECT ?coActor WHERE { GRAPH <movies> { ?mhRow ex:actor "Mark Hamill" ; ex:movie ?movie . ?coRow ex:movie ?movie ; ex:actor ?coActor . FILTER ( ?coRow != ?mhRow ) } }
 '''
 
-MEMELANG_VER = 8.15
+MEMELANG_VER = 8.16
 
 import random, re, json, operator
 from typing import List, Iterator, Iterable, Dict, Tuple, Any, Union
@@ -147,16 +148,24 @@ class Olist(list):
 class Data(Olist):
 	opr: Token = TOK_DATUM
 
+DATA_MSAME = Data(Token('MSAME', MSAME))
+DATA_VSAME = Data(Token('VSAME', VSAME))
+DATA_EMPTY = Data(Token('EMPTY', EMPTY))
+
+
 class Limit(Olist):
 	opr: Token = TOK_EQL # ELIDED '='
 
+	@property
+	def k1(self) -> str: return self[1][0].kind
+
 	def check(self) -> Limit:
 		if len(self)!=2: raise SyntaxError('E_NO_LIST')
-		if self[1][0].kind == 'VDIFF':
+		if self.k1 == 'VDIFF':
 			if self.opr.kind != 'EQL': raise SyntaxError('E_OPR_VDIFF')
 			self.opr=TOK_NOT
 			self[1]=DATA_VSAME
-		if self[1][0].kind == 'WILD':
+		if self.k1 == 'WILD':
 			if self.opr.kind == 'EQL': self.opr=TOK_NOT
 			elif self.opr.kind == 'NOT': self.opr=TOK_EQL
 			else: self.opr = TOK_GT # WILD MATCHES ANY NUMERIC
@@ -164,7 +173,10 @@ class Limit(Olist):
 		return self
 
 	@property
-	def wild(self) -> bool: return self.opr.kind in {'NOT','GT'} and self[1][0].kind == 'EMPTY'
+	def wild(self) -> bool: return self.opr.kind in {'NOT','GT'} and self.k1 == 'EMPTY'
+
+	@property
+	def eql(self) -> bool: return self.opr.kind == 'EQL'
 
 
 class Vector(Olist):
@@ -173,9 +185,6 @@ class Vector(Olist):
 class Matrix(Olist):
 	opr: Token = TOK_SEP_VCTR
 
-DATA_MSAME = Data(Token('MSAME', MSAME))
-DATA_VSAME = Data(Token('VSAME', VSAME))
-DATA_EMPTY = Data(Token('EMPTY', EMPTY))
 LIMIT_EQL_VSAME = Limit(TOK_NOVAR, DATA_VSAME, opr=TOK_EQL)
 
 def lex(src: Memelang) -> Iterator[Token]:
@@ -339,55 +348,52 @@ class Meme(Olist):
 
 
 	def to_table(self, primary_col:str = 'id') -> SQL:
+		ALIAS: Axis = 4
 		alias_idx: int = 0
-		statements = []
+		statements: List[SQL] = []
 		
 		for mtrx in self:
 			mtrx.pad(LIMIT_EQL_VSAME)
-			froms, wheres, selects = [], [], []
-			sqlbind = {}
-			prev_table, prev_alias, prev_row, prev_col = None, None, None, None
+			froms, wheres, selects, sqlbind = [], [], [], {}
+			prev = [None, None, None, None, None]
 
 			for vctr in mtrx:
-				curr_alias, curr_row = prev_alias, prev_row
-				same_row = vctr[ROW].wild or  (vctr[ROW].opr.kind == 'EQL' and (vctr[ROW][1][0].kind == 'VSAME' or (vctr[ROW][1][0].kind in {'INT', 'FLOAT', 'ALNUM'} and vctr[ROW][1][0].datum == prev_row)))
+				curr = [None, None, None, None, None]
+				same_row = vctr[ROW].eql and (vctr[ROW].k1 == 'VSAME' or (vctr[ROW].k1 in {'INT', 'FLOAT', 'ALNUM'} and vctr[ROW][1][0].datum == prev[ROW]))
 
-				# TABLE
-				if vctr[TBL].opr.kind != 'EQL': raise SyntaxError('E_SQL_SUPPORT_TO')
-				elif vctr[TBL][1][0].kind == 'VSAME': curr_table = prev_table
-				elif vctr[TBL][1][0].kind in {'ALNUM', 'QUOTE'}: curr_table = vctr[TBL][1][0].datum 
-				else: raise SyntaxError('E_SQL_SUPPORT_TV')
+				# TABLE and COLUMN
+				for axis in (TBL,COL):
+					if not vctr[axis].eql: raise SyntaxError(f'E_SQL_SUPPORT_OPR_V{axis}')
+					elif vctr[axis].k1 == 'VSAME': curr[axis] = prev[axis]
+					elif vctr[axis].k1 in {'ALNUM', 'QUOTE'}: curr[axis] = vctr[axis][1][0].datum 
+					else: raise SyntaxError(f'E_SQL_SUPPORT_VAL_V{axis}')
 
 				# TABLE ALIAS
-				if prev_table != curr_table or not same_row:
-					curr_alias = f't{alias_idx}'
-					froms.append(f'{curr_table} AS {curr_alias}')
-					prev_table = curr_table
+				if not prev[ALIAS] or prev[TBL] != curr[TBL] or not same_row:
+					curr[ALIAS] = f't{alias_idx}'
+					froms.append(f'{curr[TBL]} AS {curr[ALIAS]}')
+					prev[TBL] = curr[TBL]
 					alias_idx += 1
-
-				# COLUMN
-				if vctr[COL].opr.kind != 'EQL': raise SyntaxError('E_SQL_SUPPORT_CO')
-				elif vctr[COL][1][0].kind == 'VSAME': curr_col = prev_col
-				elif vctr[COL][1][0].kind in {'ALNUM', 'QUOTE'}: curr_col = vctr[COL][1][0].datum
-				else: raise SyntaxError('E_SQL_SUPPORT_CV')
+				else: curr[ALIAS] = prev[ALIAS]
 
 				# PRIMARY KEY
-				if not same_row:
-					if prev_alias: sqlbind[VSAME]=f'{prev_alias}.{primary_col}'
-					wheres.append(SQLUtil.compare(f'{curr_alias}.{primary_col}', vctr[ROW], sqlbind))
-					if vctr[ROW].opr.kind=='EQL' and vctr[ROW][1][0].kind in {'INT', 'FLOAT', 'ALNUM'}: curr_row = vctr[ROW][1][0].datum
-					else: curr_row = None
+				if same_row: curr[ROW] = prev[ROW]
+				else:
+					if prev[ALIAS]: sqlbind[VSAME]=f'{prev[ALIAS]}.{primary_col}'
+					wheres.append(SQLUtil.compare(f'{curr[ALIAS]}.{primary_col}', vctr[ROW], sqlbind))
+					if vctr[ROW].eql and vctr[ROW].k1 in {'INT', 'FLOAT', 'ALNUM'}: curr[ROW] = vctr[ROW][1][0].datum
+					else: curr[ROW] = None
 
 				# VALUE
-				if prev_alias: sqlbind[VSAME]=f'{prev_alias}.{prev_col}'
-				if not vctr[VAL].wild: wheres.append(SQLUtil.compare(f'{curr_alias}.{curr_col}', vctr[VAL], sqlbind))
+				if prev[ALIAS]: sqlbind[VSAME]=f'{prev[ALIAS]}.{prev[COL]}'
+				if not vctr[VAL].wild: wheres.append(SQLUtil.compare(f'{curr[ALIAS]}.{curr[COL]}', vctr[VAL], sqlbind))
 
 				# BIND VARS
-				if vctr[ROW][0].kind == 'VAR': sqlbind[vctr[ROW][0].lexeme]=f'{curr_alias}.{primary_col}'
-				if vctr[VAL][0].kind == 'VAR': sqlbind[vctr[VAL][0].lexeme]=f'{curr_alias}.{curr_col}'
+				if vctr[ROW][0].kind == 'VAR': sqlbind[vctr[ROW][0].lexeme]=f'{curr[ALIAS]}.{primary_col}'
+				if vctr[VAL][0].kind == 'VAR': sqlbind[vctr[VAL][0].lexeme]=f'{curr[ALIAS]}.{curr[COL]}'
 
-				selects.append(f'{curr_alias}.{curr_col}')
-				prev_alias, prev_row, prev_col = curr_alias, curr_row, curr_col
+				selects.append(f'{curr[ALIAS]}.{curr[COL]}')
+				prev = curr[:]
 
 			statements.append('SELECT '+ ', '.join(list(dict.fromkeys(selects))) + ' FROM ' + ', '.join(froms) + ' WHERE ' + ' AND '.join(wheres))
 
@@ -422,7 +428,8 @@ class Fuzz():
 		if kind=='VAR': return SIGIL + Fuzz.datum('ALNUM', i)
 
 	@staticmethod
-	def limit(bindings: List[str] = []) -> Memelang:
+	def limit(bindings: List[str]|None = None) -> Memelang:
+		if not bindings: bindings = []
 		var = ''
 		do_assign_variable = random.randint(0, 1)
 		if do_assign_variable: var += Fuzz.datum('VAR',3)
