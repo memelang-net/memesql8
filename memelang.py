@@ -13,20 +13,23 @@ This script is optimized for training LLMs
 2. EXAMPLE QUERY
 MEMELANG: movies * actor "Mark Hamill",Mark ; movie * ; rating >4 ;;
 SQL: SELECT t0.actor, t0.movie, t0.rating FROM movies AS t0 WHERE t0.actor IN ('Mark Hamill', 'Mark') AND t0.rating > 4
-RDF: SELECT … WHERE { GRAPH <movies> {?s actor ?o . FILTER(?o IN ("Mark Hamill","Mark")) . ?s movie ?x . ?s rating ?r . FILTER(?r > 4)} }
 
 3. VARIABLE EXAMPLE ACTOR NAME = MOVIE TITLE
 MEMELANG: movies * actor $x=* ; movie $x ;;
 SQL: SELECT rowid, actor, movie FROM movies WHERE actor=movie
 
-4. EXAMPLE JOIN QUERY
-MEMELANG: movies * actor "Mark Hamill" ; movie * ; ~ @ @ ; actor * ;;
+4. EXAMPLE JOIN
+MEMELANG: movies * actor "Mark Hamill" ; movie * ; !@ @ @ ; actor * ;;
 MEMELANG: movies $rowid=* actor "Mark Hamill" ; movie * ; !$rowid @ @ ; actor !"Mark Hamill" ;;
 SQL: SELECT t0.actor, t0.movie, t1.movie, t1.actor FROM movies AS t0, movies AS t1 WHERE t0.actor = 'Mark Hamill' AND t1.rowid != t0.rowid AND t1.movie = t0.movie
-RDF: SELECT ?coActor WHERE { GRAPH <movies> { ?mhRow ex:actor "Mark Hamill" ; ex:movie ?movie . ?coRow ex:movie ?movie ; ex:actor ?coActor . FILTER ( ?coRow != ?mhRow ) } }
+
+5. EXAMPLE TABLE JOIN WITH VARIABLE, ACTOR NAME = MOVIE TITLE
+MEMELANG: actors * age >21; name $n=* ; movies !@ title $n ;;
+MEMELANG: actors $rowid=* age >21; name * ; movies !$rowid title @ ;;
+SQL: SELECT t0.name, t0.age, t1.title FROM actors AS t0, movies AS t1 WHERE t0.age > 21 AND t1.title = t0.name;
 '''
 
-MEMELANG_VER = 8.16
+MEMELANG_VER = 8.17
 
 import random, re, json, operator
 from typing import List, Iterator, Iterable, Dict, Tuple, Any, Union
@@ -34,9 +37,10 @@ from typing import List, Iterator, Iterable, Dict, Tuple, Any, Union
 Axis, Memelang, SQL = int, str, str
 TBL, ROW, COL, VAL = Axis(3), Axis(2), Axis(1), Axis(0)
 
-SIGIL, WILD, MSAME, VSAME, VDIFF, EMPTY, EOF =  '$', '*', '^', '@', '~', '_', None
+SIGIL, WILD, MSAME, VSAME, EMPTY, EOF =  '$', '*', '^', '@', '_', None
 SEP_LIMIT, SEP_DATA, SEP_VCTR, SEP_MTRX = ' ', ',', ';', ';;'
 SEP_VCTR_PRETTY, SEP_MTRX_PRETTY = ' ; ', ' ;;\n'
+ELIDE_VSAME = True
 
 TOKEN_KIND_PATTERNS = (
 	('COMMENT',		r'//[^\n]*'),
@@ -56,7 +60,6 @@ TOKEN_KIND_PATTERNS = (
 	('WILD',		re.escape(WILD)),		# WILDCARD, MATCHES WHOLE VALUE, NEVER QUOTE
 	('MSAME',		re.escape(MSAME)),		# REFERENCES (MTRX_AXIS-1, VCTR_AXIS=-1, LIMIT_AXIS)
 	('VSAME',		re.escape(VSAME)),		# REFERENCES (MTRX_AXIS,   VCTR_AXIS-1,  LIMIT_AXIS)
-	('VDIFF',		re.escape(VDIFF)),		# ANTI-REFERENCES (MTRX_AXIS, VCTR_AXIS-1, LIMIT_AXIS)
 	('EMPTY',		re.escape(EMPTY)),		# EMPTY SET, ANTI-WILD
 	('VAR',			rf'\$[A-Za-z0-9]+'),
 	('ALNUM',		r'[A-Za-z][A-Za-z0-9]*'), # ALPHANUMERICS ARE UNQUOTED
@@ -70,9 +73,8 @@ MASTER_PATTERN = re.compile('|'.join(f'(?P<{kind}>{pat})' for kind, pat in TOKEN
 OPR_DICT = {'EQL': operator.eq, 'NOT': operator.ne, 'GT': operator.gt, 'GE': operator.ge, 'LT': operator.lt, 'LE': operator.le}
 OPR_DATA_KINDS = {'EQL','NOT'}
 SEP_KINDS = {'SEP_MTRX','SEP_VCTR','SEP_LIMIT','SEP_DATA',EOF}
-SUGAR_KINDS = {'VDIFF', 'WILD'}
-DATA_KINDS = {'ALNUM', 'QUOTE', 'INT', 'FLOAT', 'VAR', 'VSAME', 'MSAME', 'EMPTY'} # NEVER VDIFF OR WILD IN MULTI-DATA LIST
-UNITARY_KINDS = {'ALNUM', 'QUOTE', 'INT', 'FLOAT', 'EQL', 'DATUM', 'NOVAR', 'VSAME', 'MSAME'}
+DATA_KINDS = {'ALNUM', 'QUOTE', 'INT', 'FLOAT', 'VAR', 'VSAME', 'MSAME', 'EMPTY','WILD'}
+UNITARY_KINDS = {'ALNUM', 'QUOTE', 'INT', 'FLOAT', 'VSAME', 'MSAME', 'EQL', 'DATUM', 'NOVAR'}
 
 class Token():
 	kind: str
@@ -121,16 +123,16 @@ class Stream:
 		return self.buffer.pop(0)
 
 
-class Olist(list):
+class Node(list):
 	opr: Token = TOK_EQL
-	def __init__(self, *items: Union['Olist', Token], opr:Token|None = None):
+	def __init__(self, *items: Union['Node', Token], opr:Token|None = None):
 		super().__init__(items)
 		if opr is not None: self.opr = opr
 
 	def prepend(self, item):
 		self.insert(0, item)
 
-	def pad(self, padding:Union['Olist', Token]) -> None:
+	def pad(self, padding:Union['Node', Token]) -> None:
 		max_len = len(self[0])
 		for idx, item in enumerate(self):
 			diff = max_len - len(item)
@@ -140,12 +142,12 @@ class Olist(list):
 	@property
 	def unitary(self) -> bool: return self.opr.unitary and all(item.unitary for item in self)
 	def dump(self) -> List: return [self.opr.dump(), [item.dump() for item in self]]
-	def check(self) -> 'Olist': 
+	def check(self) -> 'Node': 
 		if len(self)==0: raise SyntaxError('E_NO_LIST')
 		return self
 	def __str__(self) -> Memelang: return self.opr.lexeme.join(map(str, self))
 
-class Data(Olist):
+class Data(Node):
 	opr: Token = TOK_DATUM
 
 DATA_MSAME = Data(Token('MSAME', MSAME))
@@ -153,7 +155,7 @@ DATA_VSAME = Data(Token('VSAME', VSAME))
 DATA_EMPTY = Data(Token('EMPTY', EMPTY))
 
 
-class Limit(Olist):
+class Limit(Node):
 	opr: Token = TOK_EQL # ELIDED '='
 
 	@property
@@ -161,11 +163,7 @@ class Limit(Olist):
 
 	def check(self) -> Limit:
 		if len(self)!=2: raise SyntaxError('E_NO_LIST')
-		if self.k1 == 'VDIFF':
-			if self.opr.kind != 'EQL': raise SyntaxError('E_OPR_VDIFF')
-			self.opr=TOK_NOT
-			self[1]=DATA_VSAME
-		if self.k1 == 'WILD':
+		if any(t.kind=='WILD' for t in self[1]):
 			if self.opr.kind == 'EQL': self.opr=TOK_NOT
 			elif self.opr.kind == 'NOT': self.opr=TOK_EQL
 			else: self.opr = TOK_GT # WILD MATCHES ANY NUMERIC
@@ -179,13 +177,16 @@ class Limit(Olist):
 	def eql(self) -> bool: return self.opr.kind == 'EQL'
 
 
-class Vector(Olist):
+LIMIT_EQL_VSAME = Limit(TOK_NOVAR, DATA_VSAME, opr=TOK_EQL)
+
+
+class Vector(Node):
 	opr: Token = TOK_SEP_LIMIT
 
-class Matrix(Olist):
+
+class Matrix(Node):
 	opr: Token = TOK_SEP_VCTR
 
-LIMIT_EQL_VSAME = Limit(TOK_NOVAR, DATA_VSAME, opr=TOK_EQL)
 
 def lex(src: Memelang) -> Iterator[Token]:
 	for m in MASTER_PATTERN.finditer(src):
@@ -207,6 +208,7 @@ def parse(src: Memelang) -> Iterator[Matrix]:
 		# Single axis constraint
 
 		# [VAR]
+		data = None
 		var = TOK_NOVAR
 		if tokens.peek() == 'VAR':
 			if tokens.peek(2) in OPR_DICT: 
@@ -217,11 +219,12 @@ def parse(src: Memelang) -> Iterator[Matrix]:
 		# [OPR]
 		if tokens.peek() in OPR_DICT:
 			limit.opr=tokens.next()
-			if tokens.peek()=='SEP_LIMIT': raise SyntaxError('E_NEVER_SPACE_AFTER_OPR')
-			if tokens.peek() not in DATA_KINDS|SUGAR_KINDS: raise SyntaxError('E_OPR_DAT')
+			if tokens.peek() not in DATA_KINDS:
+				if ELIDE_VSAME: data = Data(Token('VSAME', ''))
+				else: raise SyntaxError('E_NEVER_SPACE_AFTER_OPR')
 
 		# DATUM {SEP_DATA DATUM}
-		if tokens.peek() in DATA_KINDS|SUGAR_KINDS:
+		if tokens.peek() in DATA_KINDS:
 			data=Data()
 			data.append(tokens.next())
 			while tokens.peek()=='SEP_DATA':
@@ -230,10 +233,10 @@ def parse(src: Memelang) -> Iterator[Matrix]:
 				if tokens.peek() not in DATA_KINDS: raise SyntaxError('E_DATA_KIND')
 				data.append(tokens.next())
 
+		if data:
 			# LOGIC CHECKS
 			if any(t.kind == 'VAR' and t.lexeme not in bound_vars for t in data): raise SyntaxError('E_VAR_UNDEF')
 			if len(mtrx)==0 and any(t.kind == 'VSAME' for t in data): raise SyntaxError('E_VSAME_OOB')
-			if len(data)>1 and any(t.kind in SUGAR_KINDS for t in data): raise SyntaxError('E_DATA_KIND')
 			if len(data)>1 and limit.opr.kind not in OPR_DATA_KINDS: raise SyntaxError('E_DATA_OPR')
 
 			# FINALIZE LIMIT
@@ -267,8 +270,7 @@ def parse(src: Memelang) -> Iterator[Matrix]:
 
 		raise SyntaxError('E_TOK')
 
-	if vctr:
-		mtrx.append(vctr.check())
+	if vctr: mtrx.append(vctr.check())
 	if mtrx: yield mtrx.check()
 
 
@@ -294,7 +296,7 @@ class SQLUtil():
 		return f'{alias_col} {sym} {SQLUtil.escape(limit[1][0], bindings)}'
 
 
-class Meme(Olist):
+class Meme(Node):
 	opr: Token = TOK_SEP_MTRX
 	results: List[List[List[Data]]]
 	bindings: Dict[str, Tuple[Axis, Axis, Axis]]
@@ -310,7 +312,7 @@ class Meme(Olist):
 			for vctr_axis, vctr in enumerate(mtrx):
 				for limit_axis, limit in enumerate(vctr):
 					if not limit.unitary: raise SyntaxError('E_LIMIT_UNIT')
-					if limit.dump() == LIMIT_EQL_VSAME.dump():
+					if limit.opr.kind=='EQL' and limit.k1 == 'VSAME':
 						if limit_axis == 0: raise SyntaxError('E_VSAME_ZERO')
 						self.results[mtrx_axis][vctr_axis][limit_axis].extend(self.results[mtrx_axis][vctr_axis-1][limit_axis])
 					else: self.results[mtrx_axis][vctr_axis][limit_axis].extend(limit[1])
@@ -447,7 +449,6 @@ class Fuzz():
 				elif datum_type == 3:  data_list.append(Fuzz.datum('FLOAT', 100))
 				elif datum_type == 4 and bindings: data_list.append(random.choice(bindings))
 				elif datum_type == 5 and VSAME in bindings: data_list.append(VSAME)
-				elif datum_type == 6 and VSAME in bindings and opr == '=' and data_list_len == 1: data_list.append(VDIFF)
 				else: data_list.append(Fuzz.datum('ALNUM', 5))
 			data += SEP_DATA.join(data_list)
 		else:
@@ -508,8 +509,9 @@ class SQL2Memelang():
 
 if __name__ == '__main__':
 	memelangs: List[Memelang] = [
-		'movies * actor "Mark Hamill",Mark ; movie * ; rating >4 ;;',
-		'movies * actor "Mark Hamill" ; movie * ; ~ @ @ ; actor * ;;',
-		Fuzz.mtrx_table()		
+		'movies * actor "Mark Hamill",Mark ; rating >4 ; movie * ; !@ @ @ ; actor * ;;',
+		'movies $rowid=* actor "Mark Hamill",Mark ; rating >4 ; movie !_ ; !$rowid =@ =@ ; actor !_ ;;',
 	]
+	if ELIDE_VSAME: memelangs.append('movies * actor "Mark Hamill",Mark ; rating >4 ; movie * ; ! = = ; actor * ;;')
+
 	for src in memelangs: print(src, Meme(src).to_table())
