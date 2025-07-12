@@ -1,3 +1,5 @@
+MEMELANG_VER = 8.18
+
 '''
 info@memelang.net | (c)2025 HOLTWORK LLC | Patents Pending
 This script is optimized for training LLMs
@@ -29,13 +31,11 @@ MEMELANG: actors $rowid=* age >21; name * ; movies !$rowid title @ ;;
 SQL: SELECT t0.name, t0.age, t1.title FROM actors AS t0, movies AS t1 WHERE t0.age > 21 AND t1.title = t0.name;
 '''
 
-MEMELANG_VER = 8.17
-
 import random, re, json, operator
 from typing import List, Iterator, Iterable, Dict, Tuple, Any, Union
 
 Axis, Memelang, SQL = int, str, str
-TBL, ROW, COL, VAL = Axis(3), Axis(2), Axis(1), Axis(0)
+SRC, TBL, ROW, COL, VAL = Axis(4), Axis(3), Axis(2), Axis(1), Axis(0)
 
 SIGIL, WILD, MSAME, VSAME, EMPTY, EOF =  '$', '*', '^', '@', '_', None
 SEP_LIMIT, SEP_DATA, SEP_VCTR, SEP_MTRX = ' ', ',', ';', ';;'
@@ -75,6 +75,13 @@ OPR_DATA_KINDS = {'EQL','NOT'}
 SEP_KINDS = {'SEP_MTRX','SEP_VCTR','SEP_LIMIT','SEP_DATA',EOF}
 DATA_KINDS = {'ALNUM', 'QUOTE', 'INT', 'FLOAT', 'VAR', 'VSAME', 'MSAME', 'EMPTY','WILD'}
 UNITARY_KINDS = {'ALNUM', 'QUOTE', 'INT', 'FLOAT', 'VSAME', 'MSAME', 'EQL', 'DATUM', 'NOVAR'}
+
+EBNF = '''
+LIMIT ::= ([[VAR] OPR] DATUM {SEP_DATA DATUM}) | OPR
+VCTR ::= LIMIT {SEP_LIMIT LIMIT}
+MTRX ::= VCTR {SEP_VCTR VCTR}
+MEME ::= MTRX {SEP_MTRX MTRX}
+'''
 
 class Token():
 	kind: str
@@ -204,7 +211,7 @@ def parse(src: Memelang) -> Iterator[Matrix]:
 	limit=Limit()
 	while tokens.peek():
 
-		# LIMIT ::= [[VAR] OPR] DATUM {SEP_DATA DATUM}
+		# LIMIT ::= ([[VAR] OPR] DATUM {SEP_DATA DATUM}) | OPR
 		# Single axis constraint
 
 		# [VAR]
@@ -306,16 +313,7 @@ class Meme(Node):
 		self.src = src
 		self.bindings = {}
 		super().__init__(*parse(src))
-
-	def store(self): 
-		for mtrx_axis, mtrx in enumerate(self):
-			for vctr_axis, vctr in enumerate(mtrx):
-				for limit_axis, limit in enumerate(vctr):
-					if not limit.unitary: raise SyntaxError('E_LIMIT_UNIT')
-					if limit.opr.kind=='EQL' and limit.k1 == 'VSAME':
-						if limit_axis == 0: raise SyntaxError('E_VSAME_ZERO')
-						self.results[mtrx_axis][vctr_axis][limit_axis].extend(self.results[mtrx_axis][vctr_axis-1][limit_axis])
-					else: self.results[mtrx_axis][vctr_axis][limit_axis].extend(limit[1])
+		self.check()
 
 	def check(self) -> 'Meme':
 		for mtrx_axis, mtrx in enumerate(self):
@@ -333,24 +331,24 @@ class Meme(Node):
 
 	def expand(self, data: Data, from_limit_axis: Axis, from_vctr_axis: Axis, from_mtrx_axis: Axis) -> Data:
 		expansion=Data()
+		coords: Tuple[Axis, Axis, Axis] = ()
 		for tok in data:
-			if tok.kind == 'VSAME':
-				if from_vctr_axis < 1: raise SyntaxError('E_VSAME_OOB')
-				expansion.extend(self.results[from_mtrx_axis][from_vctr_axis-1][from_limit_axis])
-			elif tok.kind == 'MSAME':
-				if from_mtrx_axis < 1: raise SyntaxError('E_MSAME_OOB')
-				expansion.extend(self.results[from_mtrx_axis-1][-1][from_limit_axis])
-			elif tok.kind == 'VAR':
-				if tok.lexeme not in self.bindings: raise SyntaxError('E_VAR_BIND')
-				axes = self.bindings[tok.lexeme]
-				expansion.extend(self.results[axes[0]][axes[1]][axes[2]])
-			else: expansion.append(tok)
+			coords = ()
+			if tok.kind == 'VSAME': coords = (from_mtrx_axis, from_vctr_axis-1, from_limit_axis)
+			elif tok.kind == 'MSAME': coords = (from_mtrx_axis-1, -1, from_limit_axis)
+			elif tok.kind == 'VAR': coords = self.bindings[tok.lexeme]
+			expansion.extend(self.results[coords[0]][coords[1]][coords[2]] if coords else [tok])
 		if len(expansion)>1: expansion.opr = TOK_SEP_DATA
 		return expansion.check()
 
+	def store(self): 
+		for mtrx_axis, mtrx in enumerate(self):
+			for vctr_axis, vctr in enumerate(mtrx):
+				for limit_axis, limit in enumerate(vctr):
+					if not limit.unitary: raise SyntaxError('E_LIMIT_UNIT')
+					self.results[mtrx_axis][vctr_axis][limit_axis]=self.expand(limit[1], limit_axis, vctr_axis, mtrx_axis)
 
-	def to_table(self, primary_col:str = 'id') -> SQL:
-		ALIAS: Axis = 4
+	def to_table(self, primary_col:str = 'id', compact_mode=False) -> SQL:
 		alias_idx: int = 0
 		statements: List[SQL] = []
 		
@@ -371,30 +369,30 @@ class Meme(Node):
 					else: raise SyntaxError(f'E_SQL_SUPPORT_VAL_V{axis}')
 
 				# TABLE ALIAS
-				if not prev[ALIAS] or prev[TBL] != curr[TBL] or not same_row:
-					curr[ALIAS] = f't{alias_idx}'
-					froms.append(f'{curr[TBL]} AS {curr[ALIAS]}')
+				if not prev[SRC] or prev[TBL] != curr[TBL] or not same_row:
+					curr[SRC] = f't{alias_idx}'
+					froms.append(f'{curr[TBL]} AS {curr[SRC]}')
 					prev[TBL] = curr[TBL]
 					alias_idx += 1
-				else: curr[ALIAS] = prev[ALIAS]
+				else: curr[SRC] = prev[SRC]
 
 				# PRIMARY KEY
 				if same_row: curr[ROW] = prev[ROW]
 				else:
-					if prev[ALIAS]: sqlbind[VSAME]=f'{prev[ALIAS]}.{primary_col}'
-					wheres.append(SQLUtil.compare(f'{curr[ALIAS]}.{primary_col}', vctr[ROW], sqlbind))
+					if prev[SRC]: sqlbind[VSAME]=f'{prev[SRC]}.{primary_col}'
+					wheres.append(SQLUtil.compare(f'{curr[SRC]}.{primary_col}', vctr[ROW], sqlbind))
 					if vctr[ROW].eql and vctr[ROW].k1 in {'INT', 'FLOAT', 'ALNUM'}: curr[ROW] = vctr[ROW][1][0].datum
 					else: curr[ROW] = None
 
 				# VALUE
-				if prev[ALIAS]: sqlbind[VSAME]=f'{prev[ALIAS]}.{prev[COL]}'
-				if not vctr[VAL].wild: wheres.append(SQLUtil.compare(f'{curr[ALIAS]}.{curr[COL]}', vctr[VAL], sqlbind))
+				if prev[SRC]: sqlbind[VSAME]=f'{prev[SRC]}.{prev[COL]}'
+				if not vctr[VAL].wild: wheres.append(SQLUtil.compare(f'{curr[SRC]}.{curr[COL]}', vctr[VAL], sqlbind))
 
 				# BIND VARS
-				if vctr[ROW][0].kind == 'VAR': sqlbind[vctr[ROW][0].lexeme]=f'{curr[ALIAS]}.{primary_col}'
-				if vctr[VAL][0].kind == 'VAR': sqlbind[vctr[VAL][0].lexeme]=f'{curr[ALIAS]}.{curr[COL]}'
+				if vctr[ROW][0].kind == 'VAR': sqlbind[vctr[ROW][0].lexeme]=f'{curr[SRC]}.{primary_col}'
+				if vctr[VAL][0].kind == 'VAR': sqlbind[vctr[VAL][0].lexeme]=f'{curr[SRC]}.{curr[COL]}'
 
-				selects.append(f'{curr[ALIAS]}.{curr[COL]}')
+				if not compact_mode or not (vctr[VAL].unitary or (vctr[VAL].eql and vctr[VAL].k1 == 'VSAME')): selects.append(f'{curr[SRC]}.{curr[COL]}')
 				prev = curr[:]
 
 			statements.append('SELECT '+ ', '.join(list(dict.fromkeys(selects))) + ' FROM ' + ', '.join(froms) + ' WHERE ' + ' AND '.join(wheres))
