@@ -1,4 +1,4 @@
-MEMELANG_VER = 8.18
+MEMELANG_VER = 8.19
 
 '''
 info@memelang.net | (c)2025 HOLTWORK LLC | Patents Pending
@@ -14,21 +14,25 @@ This script is optimized for training LLMs
 
 2. EXAMPLE QUERY
 MEMELANG: movies * actor "Mark Hamill",Mark ; movie * ; rating >4 ;;
-SQL: SELECT t0.actor, t0.movie, t0.rating FROM movies AS t0 WHERE t0.actor IN ('Mark Hamill', 'Mark') AND t0.rating > 4
+SQL SIMPLE: SELECT actor, movie, rating FROM movies WHERE actor IN ('Mark Hamill', 'Mark') AND rating > 4
+SQL LITERAL: SELECT CONCAT_WS(' ', 'movies', t0.rowid, 'actor', t0.actor, ';', 'movie', t0.movie, ';', 'rating', t0.rating, ';;') AS meme FROM movies AS t0 WHERE t0.actor IN ('Mark Hamill', 'Mark') AND t0.rating > 4
 
 3. VARIABLE EXAMPLE ACTOR NAME = MOVIE TITLE
 MEMELANG: movies * actor $x=* ; movie $x ;;
-SQL: SELECT rowid, actor, movie FROM movies WHERE actor=movie
+SQL SIMPLE: SELECT rowid, actor, movie FROM movies WHERE actor=movie
+SQL LITERAL: SELECT CONCAT_WS(' ', 'movies', t0.rowid, 'actor', t0.actor, ';', 'movie' t0.movie, ';;') AS meme FROM movies AS t0 WHERE t0.actor=t0.movie
 
 4. EXAMPLE JOIN
 MEMELANG: movies * actor "Mark Hamill" ; movie * ; !@ @ @ ; actor * ;;
-MEMELANG: movies $rowid=* actor "Mark Hamill" ; movie * ; !$rowid @ @ ; actor !"Mark Hamill" ;;
-SQL: SELECT t0.actor, t0.movie, t1.movie, t1.actor FROM movies AS t0, movies AS t1 WHERE t0.actor = 'Mark Hamill' AND t1.rowid != t0.rowid AND t1.movie = t0.movie
+MEMELANG ALT: movies $rowid=* actor "Mark Hamill" ; movie * ; !$rowid @ @ ; actor !"Mark Hamill" ;;
+SQL SIMPLE: SELECT t0.actor, t0.movie, t1.movie, t1.actor FROM movies AS t0, movies AS t1 WHERE t0.actor = 'Mark Hamill' AND t1.rowid != t0.rowid AND t1.movie = t0.movie
+SQL LITERAL: SELECT	CONCAT_WS(' ', 'movies', t0.rowid, 'actor', t0.actor, ';', 'movie', t0.movie, ';', t1.rowid, 'movie', t1.movie, ';', 'actor', t1.actor, ';;' ) AS meme FROM	movies AS t0, movies AS t1 WHERE t0.actor = 'Mark Hamill' AND t1.rowid != t0.rowid AND t1.movie = t0.movie
 
 5. EXAMPLE TABLE JOIN WITH VARIABLE, ACTOR NAME = MOVIE TITLE
-MEMELANG: actors * age >21; name $n=* ; movies !@ title $n ;;
-MEMELANG: actors $rowid=* age >21; name * ; movies !$rowid title @ ;;
-SQL: SELECT t0.name, t0.age, t1.title FROM actors AS t0, movies AS t1 WHERE t0.age > 21 AND t1.title = t0.name;
+MEMELANG: actors * age >21; name $n=* ; movies * title $n ;;
+MEMELANG ALT: actors * age >21; name * ; movies * title @ ;;
+SQL SIMPLE: SELECT t0.name, t0.age, t1.title FROM actors AS t0, movies AS t1 WHERE t0.age > 21 AND t1.title = t0.name;
+SQL LITERAL: SELECT CONCAT_WS(' ', 'actors', t0.rowid, 'age', t0.age, ';', 'name', t0.name, ';', 'movies', t1.rowid, 'title', t1.title, ';;' ) AS meme FROM	actors AS t0, movies AS t1 WHERE t0.age > 21 AND t1.title = t0.name
 '''
 
 import random, re, json, operator
@@ -44,7 +48,7 @@ ELIDE_VSAME = True
 
 TOKEN_KIND_PATTERNS = (
 	('COMMENT',		r'//[^\n]*'),
-	('QUOTE',		r'"(?:[^"\\]|\\.)*"'),	# ALWAYS JSON QUOTE ESCAPE EXOTIC CHARS name="John \"Jack\" Kennedy"
+	('QUOTE',		r'"(?:[^"\\]|\\.)*"'),	# ALWAYS JSON QUOTE ESCAPE EXOTIC CHARS "John \"Jack\" Kennedy"
 	('META',		r"'[^']*'"),
 	('IGNORE',		r'-*\|'),
 	('SEP_MTRX',	re.escape(SEP_MTRX)),	# MTRX DISJUNCTION, AXIS=0
@@ -284,13 +288,11 @@ def parse(src: Memelang) -> Iterator[Matrix]:
 class SQLUtil():
 	@staticmethod
 	def escape(token: Token, bindings: dict) -> SQL:
-		if token.kind == 'VSAME':
-			if VSAME not in bindings: raise SyntaxError('E_SAME_PREV')
-			return bindings[VSAME]
-		elif token.kind == 'VAR':
+		if token.kind in {'VAR', 'VSAME'}:
 			if token.lexeme not in bindings: raise SyntaxError('E_VAR_BIND')
 			return bindings[token.lexeme]
-		return "'" + str(token.datum).replace("'", "''") + "'" if isinstance(token.datum, str) else str(token.datum)
+		elif token.kind in {'INT', 'FLOAT'}: return str(token.datum)
+		return "'" + str(token.datum).replace("'", "''") + "'"
 
 	@staticmethod
 	def compare(alias_col: str, limit: Limit, bindings: dict) -> SQL:
@@ -348,7 +350,7 @@ class Meme(Node):
 					if not limit.unitary: raise SyntaxError('E_LIMIT_UNIT')
 					self.results[mtrx_axis][vctr_axis][limit_axis]=self.expand(limit[1], limit_axis, vctr_axis, mtrx_axis)
 
-	def to_table(self, primary_col:str = 'id', compact_mode=False) -> SQL:
+	def select_table(self, primary_col:str = 'id') -> List[SQL]:
 		alias_idx: int = 0
 		statements: List[SQL] = []
 		
@@ -359,45 +361,44 @@ class Meme(Node):
 
 			for vctr in mtrx:
 				curr = [None, None, None, None, None]
-				same_row = vctr[ROW].eql and (vctr[ROW].k1 == 'VSAME' or (vctr[ROW].k1 in {'INT', 'FLOAT', 'ALNUM'} and vctr[ROW][1][0].datum == prev[ROW]))
 
-				# TABLE and COLUMN
-				for axis in (TBL,COL):
-					if not vctr[axis].eql: raise SyntaxError(f'E_SQL_SUPPORT_OPR_V{axis}')
-					elif vctr[axis].k1 == 'VSAME': curr[axis] = prev[axis]
-					elif vctr[axis].k1 in {'ALNUM', 'QUOTE'}: curr[axis] = vctr[axis][1][0].datum 
+				for axis in (TBL,ROW,COL):
+					if vctr[axis].eql and vctr[axis].k1 == 'VSAME': curr[axis] = prev[axis]
+					elif vctr[axis].unitary: curr[axis] = vctr[axis][1][0].datum
+					elif axis == ROW: curr[ROW] = None
 					else: raise SyntaxError(f'E_SQL_SUPPORT_VAL_V{axis}')
 
-				# TABLE ALIAS
-				if not prev[SRC] or prev[TBL] != curr[TBL] or not same_row:
+				# JOIN
+				if prev[TBL] != curr[TBL] or curr[ROW] is None or prev[ROW] != curr[ROW]:
+
+					# TABLE ALIAS
 					curr[SRC] = f't{alias_idx}'
 					froms.append(f'{curr[TBL]} AS {curr[SRC]}')
-					prev[TBL] = curr[TBL]
 					alias_idx += 1
-				else: curr[SRC] = prev[SRC]
 
-				# PRIMARY KEY
-				if same_row: curr[ROW] = prev[ROW]
-				else:
+					# PRIMARY KEY
+					if curr[ROW] is None: curr[ROW]=True
 					if prev[SRC]: sqlbind[VSAME]=f'{prev[SRC]}.{primary_col}'
 					wheres.append(SQLUtil.compare(f'{curr[SRC]}.{primary_col}', vctr[ROW], sqlbind))
-					if vctr[ROW].eql and vctr[ROW].k1 in {'INT', 'FLOAT', 'ALNUM'}: curr[ROW] = vctr[ROW][1][0].datum
-					else: curr[ROW] = None
 
-				# VALUE
+					if prev[TBL] != curr[TBL]: selects.append(f"'{curr[TBL]}'")
+					selects.append(f'{curr[SRC]}.{primary_col}')
+
+				# COLUMN = VALUE
 				if prev[SRC]: sqlbind[VSAME]=f'{prev[SRC]}.{prev[COL]}'
 				if not vctr[VAL].wild: wheres.append(SQLUtil.compare(f'{curr[SRC]}.{curr[COL]}', vctr[VAL], sqlbind))
+				selects.extend([f"'{curr[COL]}'", f'{curr[SRC]}.{curr[COL]}', f"'{SEP_VCTR}'"])
 
 				# BIND VARS
 				if vctr[ROW][0].kind == 'VAR': sqlbind[vctr[ROW][0].lexeme]=f'{curr[SRC]}.{primary_col}'
 				if vctr[VAL][0].kind == 'VAR': sqlbind[vctr[VAL][0].lexeme]=f'{curr[SRC]}.{curr[COL]}'
 
-				if not compact_mode or not (vctr[VAL].unitary or (vctr[VAL].eql and vctr[VAL].k1 == 'VSAME')): selects.append(f'{curr[SRC]}.{curr[COL]}')
 				prev = curr[:]
 
-			statements.append('SELECT '+ ', '.join(list(dict.fromkeys(selects))) + ' FROM ' + ', '.join(froms) + ' WHERE ' + ' AND '.join(wheres))
+			selects.append(f"'{SEP_MTRX}'")
+			statements.append('SELECT CONCAT_WS(\'{SEP_LIMIT}\', '+ ', '.join(selects) + ') AS meme FROM ' + ', '.join(froms) + ' WHERE ' + ' AND '.join(wheres))
 
-		return ' UNION '.join(statements)
+		return statements
 
 
 def intersect(query: Limit, store: Data) -> Data:
@@ -512,4 +513,4 @@ if __name__ == '__main__':
 	]
 	if ELIDE_VSAME: memelangs.append('movies * actor "Mark Hamill",Mark ; rating >4 ; movie * ; ! = = ; actor * ;;')
 
-	for src in memelangs: print(src, Meme(src).to_table())
+	for src in memelangs: print(src, Meme(src).select_table())
