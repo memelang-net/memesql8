@@ -1,4 +1,4 @@
-MEMELANG_VER = 8.19
+MEMELANG_VER = 8.20
 
 '''
 info@memelang.net | (c)2025 HOLTWORK LLC | Patents Pending
@@ -15,24 +15,24 @@ This script is optimized for training LLMs
 2. EXAMPLE QUERY
 MEMELANG: movies * actor "Mark Hamill",Mark ; movie * ; rating >4 ;;
 SQL SIMPLE: SELECT actor, movie, rating FROM movies WHERE actor IN ('Mark Hamill', 'Mark') AND rating > 4
-SQL LITERAL: SELECT CONCAT_WS(' ', 'movies', t0.rowid, 'actor', t0.actor, ';', 'movie', t0.movie, ';', 'rating', t0.rating, ';;') AS meme FROM movies AS t0 WHERE t0.actor IN ('Mark Hamill', 'Mark') AND t0.rating > 4
+SQL LITERAL: SELECT CONCAT_WS(' ', 'movies', t0.prikey, 'actor', t0.actor, ';', 'movie', t0.movie, ';', 'rating', t0.rating, ';;') AS meme FROM movies AS t0 WHERE t0.actor IN ('Mark Hamill', 'Mark') AND t0.rating > 4
 
 3. VARIABLE EXAMPLE ACTOR NAME = MOVIE TITLE
 MEMELANG: movies * actor $x=* ; movie $x ;;
-SQL SIMPLE: SELECT rowid, actor, movie FROM movies WHERE actor=movie
-SQL LITERAL: SELECT CONCAT_WS(' ', 'movies', t0.rowid, 'actor', t0.actor, ';', 'movie' t0.movie, ';;') AS meme FROM movies AS t0 WHERE t0.actor=t0.movie
+SQL SIMPLE: SELECT prikey, actor, movie FROM movies WHERE actor=movie
+SQL LITERAL: SELECT CONCAT_WS(' ', 'movies', t0.prikey, 'actor', t0.actor, ';', 'movie', t0.movie, ';;') AS meme FROM movies AS t0 WHERE t0.actor=t0.movie
 
 4. EXAMPLE JOIN
 MEMELANG: movies * actor "Mark Hamill" ; movie * ; !@ @ @ ; actor * ;;
-MEMELANG ALT: movies $rowid=* actor "Mark Hamill" ; movie * ; !$rowid @ @ ; actor !"Mark Hamill" ;;
-SQL SIMPLE: SELECT t0.actor, t0.movie, t1.movie, t1.actor FROM movies AS t0, movies AS t1 WHERE t0.actor = 'Mark Hamill' AND t1.rowid != t0.rowid AND t1.movie = t0.movie
-SQL LITERAL: SELECT	CONCAT_WS(' ', 'movies', t0.rowid, 'actor', t0.actor, ';', 'movie', t0.movie, ';', t1.rowid, 'movie', t1.movie, ';', 'actor', t1.actor, ';;' ) AS meme FROM	movies AS t0, movies AS t1 WHERE t0.actor = 'Mark Hamill' AND t1.rowid != t0.rowid AND t1.movie = t0.movie
+MEMELANG ALT: movies $prikey=* actor "Mark Hamill" ; movie * ; !$prikey @ @ ; actor !"Mark Hamill" ;;
+SQL SIMPLE: SELECT t0.actor, t0.movie, t1.movie, t1.actor FROM movies AS t0, movies AS t1 WHERE t0.actor = 'Mark Hamill' AND t1.prikey != t0.prikey AND t1.movie = t0.movie
+SQL LITERAL: SELECT CONCAT_WS(' ', 'movies', t0.prikey, 'actor', t0.actor, ';', 'movie', t0.movie, ';', t1.prikey, 'movie', t1.movie, ';', 'actor', t1.actor, ';;' ) AS meme FROM	movies AS t0, movies AS t1 WHERE t0.actor = 'Mark Hamill' AND t1.prikey != t0.prikey AND t1.movie = t0.movie
 
 5. EXAMPLE TABLE JOIN WITH VARIABLE, ACTOR NAME = MOVIE TITLE
 MEMELANG: actors * age >21; name $n=* ; movies * title $n ;;
 MEMELANG ALT: actors * age >21; name * ; movies * title @ ;;
 SQL SIMPLE: SELECT t0.name, t0.age, t1.title FROM actors AS t0, movies AS t1 WHERE t0.age > 21 AND t1.title = t0.name;
-SQL LITERAL: SELECT CONCAT_WS(' ', 'actors', t0.rowid, 'age', t0.age, ';', 'name', t0.name, ';', 'movies', t1.rowid, 'title', t1.title, ';;' ) AS meme FROM	actors AS t0, movies AS t1 WHERE t0.age > 21 AND t1.title = t0.name
+SQL LITERAL: SELECT CONCAT_WS(' ', 'actors', t0.prikey, 'age', t0.age, ';', 'name', t0.name, ';', 'movies', t1.prikey, 'title', t1.title, ';;' ) AS meme FROM	actors AS t0, movies AS t1 WHERE t0.age > 21 AND t1.title = t0.name
 '''
 
 import random, re, json, operator
@@ -65,7 +65,7 @@ TOKEN_KIND_PATTERNS = (
 	('MSAME',		re.escape(MSAME)),		# REFERENCES (MTRX_AXIS-1, VCTR_AXIS=-1, LIMIT_AXIS)
 	('VSAME',		re.escape(VSAME)),		# REFERENCES (MTRX_AXIS,   VCTR_AXIS-1,  LIMIT_AXIS)
 	('EMPTY',		re.escape(EMPTY)),		# EMPTY SET, ANTI-WILD
-	('VAR',			rf'\$[A-Za-z0-9]+'),
+	('VAR',			r'\$[A-Za-z0-9]+'),
 	('ALNUM',		r'[A-Za-z][A-Za-z0-9]*'), # ALPHANUMERICS ARE UNQUOTED
 	('FLOAT',		r'-?\d*\.\d+'),
 	('INT',			r'-?\d+'),
@@ -101,7 +101,7 @@ class Token():
 
 	@property
 	def unitary(self) -> bool: return self.kind in UNITARY_KINDS
-	def dump(self) -> str: return self.datum
+	def dump(self) -> str|float|int: return self.datum
 	def __str__(self) -> Memelang: return self.lexeme
 
 
@@ -158,8 +158,10 @@ class Node(list):
 		return self
 	def __str__(self) -> Memelang: return self.opr.lexeme.join(map(str, self))
 
+
 class Data(Node):
 	opr: Token = TOK_DATUM
+
 
 DATA_MSAME = Data(Token('MSAME', MSAME))
 DATA_VSAME = Data(Token('VSAME', VSAME))
@@ -180,12 +182,6 @@ class Limit(Node):
 			else: self.opr = TOK_GT # WILD MATCHES ANY NUMERIC
 			self[1]=DATA_EMPTY
 		return self
-
-	@property
-	def wild(self) -> bool: return self.opr.kind in {'NOT','GT'} and self.k1 == 'EMPTY'
-
-	@property
-	def eql(self) -> bool: return self.opr.kind == 'EQL'
 
 
 LIMIT_EQL_VSAME = Limit(TOK_NOVAR, DATA_VSAME, opr=TOK_EQL)
@@ -210,9 +206,9 @@ def lex(src: Memelang) -> Iterator[Token]:
 def parse(src: Memelang) -> Iterator[Matrix]:
 	tokens = Stream(lex(src))
 	bound_vars = []
-	mtrx=Matrix()
-	vctr=Vector()
-	limit=Limit()
+	mtrx = Matrix()
+	vctr = Vector()
+	limit = Limit()
 	while tokens.peek():
 
 		# LIMIT ::= ([[VAR] OPR] DATUM {SEP_DATA DATUM}) | OPR
@@ -290,8 +286,8 @@ class SQLUtil():
 	def escape(token: Token, bindings: dict) -> SQL:
 		if token.kind in {'VAR', 'VSAME'}:
 			if token.lexeme not in bindings: raise SyntaxError('E_VAR_BIND')
-			return bindings[token.lexeme]
-		elif token.kind in {'INT', 'FLOAT'}: return str(token.datum)
+			return SQLUtil.escape(bindings[token.lexeme], bindings)
+		elif token.kind in {'DBCOL', 'INT', 'FLOAT'}: return str(token.datum)
 		return "'" + str(token.datum).replace("'", "''") + "'"
 
 	@staticmethod
@@ -350,26 +346,26 @@ class Meme(Node):
 					if not limit.unitary: raise SyntaxError('E_LIMIT_UNIT')
 					self.results[mtrx_axis][vctr_axis][limit_axis]=self.expand(limit[1], limit_axis, vctr_axis, mtrx_axis)
 
-	def select_table(self, primary_col:str = 'id') -> List[SQL]:
+
+	def select_table(self, primary_col:str = 'id') -> SQL:
 		alias_idx: int = 0
 		statements: List[SQL] = []
 		
 		for mtrx in self:
-			mtrx.pad(LIMIT_EQL_VSAME)
 			froms, wheres, selects, sqlbind = [], [], [], {}
 			prev = [None, None, None, None, None]
 
 			for vctr in mtrx:
-				curr = [None, None, None, None, None]
+				curr = [None, None, None, None, prev[SRC]]
 
-				for axis in (TBL,ROW,COL):
-					if vctr[axis].eql and vctr[axis].k1 == 'VSAME': curr[axis] = prev[axis]
-					elif vctr[axis].unitary: curr[axis] = vctr[axis][1][0].datum
-					elif axis == ROW: curr[ROW] = None
-					else: raise SyntaxError(f'E_SQL_SUPPORT_VAL_V{axis}')
+				for axis in (TBL,ROW,COL,VAL):
+					if vctr[axis].opr.kind == 'EQL' and vctr[axis].k1 == 'VSAME': curr[axis] = prev[axis]
+					elif vctr[axis].unitary: curr[axis] = vctr[axis][1][0]
+					elif axis in (ROW,VAL): curr[axis] = None
+					else: raise SyntaxError(f'E_SQL_SUPPORT_V{axis}')
 
 				# JOIN
-				if prev[TBL] != curr[TBL] or curr[ROW] is None or prev[ROW] != curr[ROW]:
+				if prev[SRC] is None or any(curr[axis] is None or prev[axis] != curr[axis] for axis in (TBL,ROW)):
 
 					# TABLE ALIAS
 					curr[SRC] = f't{alias_idx}'
@@ -377,28 +373,83 @@ class Meme(Node):
 					alias_idx += 1
 
 					# PRIMARY KEY
-					if curr[ROW] is None: curr[ROW]=True
-					if prev[SRC]: sqlbind[VSAME]=f'{prev[SRC]}.{primary_col}'
-					wheres.append(SQLUtil.compare(f'{curr[SRC]}.{primary_col}', vctr[ROW], sqlbind))
+					if curr[ROW] is None: curr[ROW]=Token('DBCOL', f'{curr[SRC]}.{primary_col}')
+					if prev[ROW] is not None: sqlbind[VSAME]=prev[ROW]
+					if vctr[ROW].k1 != 'EMPTY': wheres.append(SQLUtil.compare(f'{curr[SRC]}.{primary_col}', vctr[ROW], sqlbind))
 
 					if prev[TBL] != curr[TBL]: selects.append(f"'{curr[TBL]}'")
 					selects.append(f'{curr[SRC]}.{primary_col}')
 
 				# COLUMN = VALUE
-				if prev[SRC]: sqlbind[VSAME]=f'{prev[SRC]}.{prev[COL]}'
-				if not vctr[VAL].wild: wheres.append(SQLUtil.compare(f'{curr[SRC]}.{curr[COL]}', vctr[VAL], sqlbind))
-				selects.extend([f"'{curr[COL]}'", f'{curr[SRC]}.{curr[COL]}', f"'{SEP_VCTR}'"])
+				ccol = curr[COL].datum
+				cacol = f'{curr[SRC]}.{ccol}'
+				if curr[VAL] is None: curr[VAL]=Token('DBCOL', cacol)
+				if prev[VAL] is not None: sqlbind[VSAME]=prev[VAL]
+				if vctr[VAL].k1 != 'EMPTY': wheres.append(SQLUtil.compare(cacol, vctr[VAL], sqlbind))
+				selects.extend([f"'{ccol}'", cacol, f"'{SEP_VCTR}'"])
 
 				# BIND VARS
-				if vctr[ROW][0].kind == 'VAR': sqlbind[vctr[ROW][0].lexeme]=f'{curr[SRC]}.{primary_col}'
-				if vctr[VAL][0].kind == 'VAR': sqlbind[vctr[VAL][0].lexeme]=f'{curr[SRC]}.{curr[COL]}'
+				for axis in (ROW,VAL):
+					if vctr[axis][0].kind == 'VAR': sqlbind[vctr[axis][0].lexeme]=curr[axis]
 
 				prev = curr[:]
 
+			if not wheres: raise SyntaxError('E_EMPTY_WHERE')
 			selects.append(f"'{SEP_MTRX}'")
-			statements.append('SELECT CONCAT_WS(\'{SEP_LIMIT}\', '+ ', '.join(selects) + ') AS meme FROM ' + ', '.join(froms) + ' WHERE ' + ' AND '.join(wheres))
+			statements.append(f'SELECT CONCAT_WS(\'{SEP_LIMIT}\', ' + ', '.join(selects) + ') AS meme FROM ' + ', '.join(froms) + ' WHERE ' + ' AND '.join(wheres))
+		return ' UNION '.join(statements) + ';'
 
-		return statements
+	vtbl_table = 'CREATE TABLE IF NOT EXISTS vtbl (a3 TEXT, a2 BIGINT, a1 TEXT, a0s TEXT, a0f DOUBLE PRECISION);'
+
+	def select_vtbl(self, vtbl = 'vtbl' gb_axis: Axis = ROW, s_f_split: bool = True) -> SQL:
+
+		src = -1
+		alias_idx: int = 0
+		statements: List[SQL] = []
+		
+		for mtrx in self:
+			froms, wheres, selects, groupbys, sqlbind = [], [], [], [], {}
+
+			vlen = len(mtrx[0])
+			prev = [None] * (vlen + 1)
+
+			for vctr in mtrx:
+				curr = [None] * vlen
+				curr.append(f'v{alias_idx}')
+				froms.append(f'{vtbl} AS {curr[src]}')
+
+				for axis in range(vlen-1, -1, -1):
+					acol = f'a{axis}'
+					sel_col = f'{curr[src]}.a{axis}'
+
+					if s_f_split and axis == VAL:
+						if vctr[axis].opr.kind in {'GT','LT','GE','LE'} or vctr[axis].k1 in {'INT','FLOAT'}: acol, sel_col = f'a0f', f'{curr[src]}.a0f'
+						elif vctr[axis].k1 in {'ALNUM','QUOTE'}: acol, sel_col = f'a0s', f'\'"\' || {curr[src]}.a0s || \'"\''
+						else:  acol, sel_col = f'a0s', f'(CASE WHEN {curr[src]}.a0f IS NOT NULL THEN {curr[src]}.a0f::text ELSE \'"\' || {curr[src]}.a0s || \'"\' END)'
+
+					whr_col = f'{curr[src]}.{acol}'
+					selects.append(sel_col)
+					
+					if (vctr[axis].opr.kind, vctr[axis].k1) == ('EQL', 'VSAME'): curr[axis] = prev[axis]
+					elif vctr[axis].unitary: curr[axis] = vctr[axis][1][0]
+					else: curr[axis] = Token('DBCOL', whr_col)
+
+					if prev[axis] is not None: sqlbind[VSAME]=prev[axis]
+					if vctr[axis].k1 != 'EMPTY': wheres.append(SQLUtil.compare(whr_col, vctr[axis], sqlbind))
+
+					if vctr[axis][0].kind == 'VAR': sqlbind[vctr[axis][0].lexeme]=curr[axis]
+
+				if prev[src] is not None and any(prev[axis] != curr[axis] for axis in range(vlen-1, gb_axis-1, -1)):
+					for a in range(vlen-1, gb_axis-1, -1): groupbys.append(f"{curr[src]}.a{a}")
+
+				selects.append(f"'{SEP_VCTR}'")
+				prev = curr[:]
+				alias_idx += 1
+
+			selects.append(f"'{SEP_MTRX}'")
+			groupbystr = ' GROUP BY ' + ', '.join(groupbys) if groupbys else ''
+			statements.append(f'SELECT CONCAT_WS(\'{SEP_LIMIT}\', ' + ', '.join(selects) + ') AS meme FROM ' + ', '.join(froms) + ' WHERE ' + ' AND '.join(wheres) + groupbystr)
+		return ' UNION '.join(statements) + ';'
 
 
 def intersect(query: Limit, store: Data) -> Data:
@@ -435,7 +486,7 @@ class Fuzz():
 		do_assign_variable = random.randint(0, 1)
 		if do_assign_variable: var += Fuzz.datum('VAR',3)
 
-		opr = random.choice(['=','!','>','<','<=','>='])
+		opr = random.choice(['=','!=','>','<','<=','>='])
 
 		data: str = ''
 		if opr in {'=','!'}:
@@ -485,8 +536,8 @@ class SQL2Memelang():
 			if len(cells)!=len(header):continue
 			id_val=cells[0]
 			parts=[f'{header[i]} {cells[i]}' for i in range(1,len(header))]
-			mtrxs.append(f'$rowid={id_val} ' + SEP_VCTR_PRETTY.join(parts))
-		return SEP_MTRX_PRETTY.join(mtrxs)
+			mtrxs.append(f'$prikey={id_val} ' + SEP_VCTR_PRETTY.join(parts))
+		return SEP_MTRX_PRETTY.join(mtrxs) + SEP_MTRX_PRETTY
 
 	@staticmethod
 	def insert(sql_insert: SQL) -> Memelang:
@@ -499,17 +550,17 @@ class SQL2Memelang():
 		for idx, row in enumerate(rows_sql):
 			cells = [c.strip(" '\"") for c in re.findall(r"'[^']*'|[^,]+", row)]
 			if len(cells) != len(header): continue
-			rowid = cells[0]
+			prikey = cells[0]
 			col_tokens = header[1:] if idx == 0 else [MSAME] * (len(header) - 1)
 			parts = [f'{col_tokens[i]} {cells[i + 1]}' for i in range(len(col_tokens))]
-			mtrxs.append(f'{table} $rowid={rowid} ' + SEP_VCTR_PRETTY.join(parts))
-		return SEP_MTRX_PRETTY.join(mtrxs)
+			mtrxs.append(f'{table} $prikey={prikey} ' + SEP_VCTR_PRETTY.join(parts))
+		return SEP_MTRX_PRETTY.join(mtrxs) + SEP_MTRX_PRETTY
 
 
 if __name__ == '__main__':
 	memelangs: List[Memelang] = [
 		'movies * actor "Mark Hamill",Mark ; rating >4 ; movie * ; !@ @ @ ; actor * ;;',
-		'movies $rowid=* actor "Mark Hamill",Mark ; rating >4 ; movie !_ ; !$rowid =@ =@ ; actor !_ ;;',
+		'movies $prikey=* actor "Mark Hamill",Mark ; rating >4 ; movie !_ ; !$prikey =@ =@ ; actor !_ ;;',
 	]
 	if ELIDE_VSAME: memelangs.append('movies * actor "Mark Hamill",Mark ; rating >4 ; movie * ; ! = = ; actor * ;;')
 
