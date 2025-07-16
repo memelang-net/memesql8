@@ -401,7 +401,7 @@ class Meme(Node):
 
 	vtbl_table = 'CREATE TABLE IF NOT EXISTS vtbl (a3 TEXT, a2 BIGINT, a1 TEXT, a0s TEXT, a0f DOUBLE PRECISION);'
 
-	def select_vtbl(self, vtbl = 'vtbl' gb_axis: Axis = ROW, s_f_split: bool = True) -> SQL:
+	def select_vtbl(self, vtbl = 'vtbl', gb_axis: Axis = ROW, s_f_split: bool = True) -> SQL:
 
 		src = -1
 		alias_idx: int = 0
