@@ -1,4 +1,4 @@
-MEMELANG_VER = 8.20
+MEMELANG_VER = 8.21
 
 '''
 info@memelang.net | (c)2025 HOLTWORK LLC | Patents Pending
@@ -39,7 +39,6 @@ import random, re, json, operator
 from typing import List, Iterator, Iterable, Dict, Tuple, Any, Union
 
 Axis, Memelang, SQL = int, str, str
-SRC, TBL, ROW, COL, VAL = Axis(4), Axis(3), Axis(2), Axis(1), Axis(0)
 
 SIGIL, WILD, MSAME, VSAME, EMPTY, EOF =  '$', '*', '^', '@', '_', None
 SEP_LIMIT, SEP_DATA, SEP_VCTR, SEP_MTRX = ' ', ',', ';', ';;'
@@ -120,12 +119,14 @@ class Stream:
 	def __init__(self, token: Iterable[Token]):
 		self.token: Iterator[Token] = iter(token)
 		self.buffer: List[Token] = []
+
 	def peek(self, fwd: int = 1) -> Union[str, None]:
 		while(len(self.buffer)<fwd):
 			val = next(self.token, EOF)
 			if val is EOF: return EOF
 			self.buffer.append(val)
 		return self.buffer[fwd-1].kind
+		
 	def next(self) -> Token: 
 		if not self.buffer:
 			val = next(self.token, EOF)
@@ -347,16 +348,17 @@ class Meme(Node):
 					self.results[mtrx_axis][vctr_axis][limit_axis]=self.expand(limit[1], limit_axis, vctr_axis, mtrx_axis)
 
 
-	def select_table(self, primary_col:str = 'id') -> SQL:
+	def select_table(self, primary_col: str = 'id', TBL: Axis = 3, ROW: Axis = 2, COL: Axis = 1, VAL: Axis = 0) -> SQL:
 		alias_idx: int = 0
 		statements: List[SQL] = []
+		SRC = -1
 		
 		for mtrx in self:
 			froms, wheres, selects, sqlbind = [], [], [], {}
-			prev = [None, None, None, None, None]
+			prev = {SRC:None, TBL:None, ROW:None, COL:None, VAL:None}
 
 			for vctr in mtrx:
-				curr = [None, None, None, None, prev[SRC]]
+				curr = {SRC:prev[SRC], TBL:None, ROW:None, COL:None, VAL:None}
 
 				for axis in (TBL,ROW,COL,VAL):
 					if vctr[axis].opr.kind == 'EQL' and vctr[axis].k1 == 'VSAME': curr[axis] = prev[axis]
@@ -399,9 +401,9 @@ class Meme(Node):
 			statements.append(f'SELECT CONCAT_WS(\'{SEP_LIMIT}\', ' + ', '.join(selects) + ') AS meme FROM ' + ', '.join(froms) + ' WHERE ' + ' AND '.join(wheres))
 		return ' UNION '.join(statements) + ';'
 
-	vtbl_table = 'CREATE TABLE IF NOT EXISTS vtbl (a3 TEXT, a2 BIGINT, a1 TEXT, a0s TEXT, a0f DOUBLE PRECISION);'
+	vtbl_table = 'CREATE TABLE IF NOT EXISTS vtbl (a3 TEXT, a2 BIGINT, a1 TEXT, a0s TEXT, a0id BIGINT, a0f DOUBLE PRECISION);'
 
-	def select_vtbl(self, vtbl = 'vtbl', gb_axis: Axis = ROW, s_f_split: bool = True) -> SQL:
+	def select_vtbl(self, vtbl = 'vtbl', groupby_axis: Axis = 2, s_i_f_axis: Axis|None = 0) -> SQL:
 
 		src = -1
 		alias_idx: int = 0
@@ -422,7 +424,7 @@ class Meme(Node):
 					acol = f'a{axis}'
 					sel_col = f'{curr[src]}.a{axis}'
 
-					if s_f_split and axis == VAL:
+					if axis == s_i_f_axis:
 						if vctr[axis].opr.kind in {'GT','LT','GE','LE'} or vctr[axis].k1 in {'INT','FLOAT'}: acol, sel_col = f'a0f', f'{curr[src]}.a0f'
 						elif vctr[axis].k1 in {'ALNUM','QUOTE'}: acol, sel_col = f'a0s', f'\'"\' || {curr[src]}.a0s || \'"\''
 						else:  acol, sel_col = f'a0s', f'(CASE WHEN {curr[src]}.a0f IS NOT NULL THEN {curr[src]}.a0f::text ELSE \'"\' || {curr[src]}.a0s || \'"\' END)'
@@ -439,8 +441,8 @@ class Meme(Node):
 
 					if vctr[axis][0].kind == 'VAR': sqlbind[vctr[axis][0].lexeme]=curr[axis]
 
-				if prev[src] is not None and any(prev[axis] != curr[axis] for axis in range(vlen-1, gb_axis-1, -1)):
-					for a in range(vlen-1, gb_axis-1, -1): groupbys.append(f"{curr[src]}.a{a}")
+				if prev[src] is not None and any(prev[axis] != curr[axis] for axis in range(vlen-1, groupby_axis-1, -1)):
+					for a in range(vlen-1, groupby_axis-1, -1): groupbys.append(f"{curr[src]}.a{a}")
 
 				selects.append(f"'{SEP_VCTR}'")
 				prev = curr[:]
@@ -449,6 +451,7 @@ class Meme(Node):
 			selects.append(f"'{SEP_MTRX}'")
 			groupbystr = ' GROUP BY ' + ', '.join(groupbys) if groupbys else ''
 			statements.append(f'SELECT CONCAT_WS(\'{SEP_LIMIT}\', ' + ', '.join(selects) + ') AS meme FROM ' + ', '.join(froms) + ' WHERE ' + ' AND '.join(wheres) + groupbystr)
+		
 		return ' UNION '.join(statements) + ';'
 
 
